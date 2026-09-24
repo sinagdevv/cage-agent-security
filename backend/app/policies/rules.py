@@ -1,10 +1,14 @@
 """Deterministic security rules and precedence-based policy evaluation.
 
-Implements Rules A, B, C, and D with strict precedence resolution:
+Integrates task-scoped Intent Contract authorization with runtime security policies:
+Intent Authorization AND Runtime Security Policy = Final Decision
+
+Precedence resolution:
 DENY > QUARANTINE > SANDBOX > REQUIRE_APPROVAL > ALLOW_WITH_LIMITS > ALLOW.
 """
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from app.gateway.registry import ToolRegistry, default_tool_registry
 from app.schemas.action import AgentAction
@@ -15,6 +19,9 @@ from app.schemas.enums import (
     PolicyDecision,
     TargetEnvironment,
 )
+
+if TYPE_CHECKING:
+    from app.schemas.intent import IntentContract
 
 
 @dataclass(frozen=True)
@@ -28,27 +35,56 @@ class MatchedRule:
 
 
 class DeterministicPolicyEvaluator:
-    """Deterministic policy evaluator for Phase 1 governance."""
+    """Deterministic policy evaluator for CAGE governance."""
 
     def __init__(self, tool_registry: ToolRegistry | None = None) -> None:
         self.tool_registry = tool_registry or default_tool_registry
 
-    def evaluate(self, action: AgentAction) -> SecurityDecision:
-        """Evaluate an authoritative AgentAction against all rules and resolve with precedence."""
+    def evaluate(
+        self,
+        action: AgentAction,
+        contract: "IntentContract | None" = None,
+        require_intent: bool = False,
+        intent_mismatch: bool = False,
+    ) -> SecurityDecision:
+        """Evaluate an authoritative AgentAction against Intent rules and runtime policies.
+
+        Evaluates ALL applicable rules first, then resolves the final verdict deterministically
+        according to the severity rank hierarchy:
+        DENY > QUARANTINE > SANDBOX > REQUIRE_APPROVAL > ALLOW_WITH_LIMITS > ALLOW.
+        """
         tool_spec = self.tool_registry.get(action.tool_name)
         matched_rules: list[MatchedRule] = []
 
+        # =============================================================
+        # 1. Intent Scope Evaluation (Task Authority)
+        # =============================================================
+        from app.policies.intent_rules import default_intent_rules_evaluator
+
+        intent_matched = default_intent_rules_evaluator.evaluate_intent(
+            action=action,
+            contract=contract,
+            require_intent=require_intent,
+            intent_mismatch=intent_mismatch,
+        )
+        matched_rules.extend(intent_matched)
+
+        # =============================================================
+        # 2. Runtime Security Policies (Phase 1 Rules)
+        # =============================================================
+
         # -------------------------------------------------------------
         # Rule B: Credential / Secret Exfiltration Prevention
-        # If classification has SECRET or CREDENTIAL and destination is an external sink
+        # Effective classifications combine server_known UNION client_declared
         # -------------------------------------------------------------
         sensitive_classifications = {
             DataClassification.SECRET,
             DataClassification.CREDENTIAL,
         }
-        has_sensitive_data = any(
-            c in sensitive_classifications for c in action.data_classifications
+        effective_classifications = self.tool_registry.get_effective_classifications(
+            action.tool_name, action.data_classifications
         )
+        has_sensitive_data = any(c in sensitive_classifications for c in effective_classifications)
         is_external_sink = tool_spec.external_sink
 
         if has_sensitive_data and is_external_sink:
@@ -64,8 +100,6 @@ class DeterministicPolicyEvaluator:
         # -------------------------------------------------------------
         # Rule A: Production Destructive Operation Guard
         # If target_environment == PRODUCTION and tool or action is destructive
-        # Note: We rely on trusted ToolRegistry.destructive or action_type == ActionType.DESTRUCTIVE,
-        # NOT on untrusted agent expected_effect!
         # -------------------------------------------------------------
         is_destructive = tool_spec.destructive or action.action_type == ActionType.DESTRUCTIVE
         if action.target_environment == TargetEnvironment.PRODUCTION and is_destructive:
@@ -80,7 +114,6 @@ class DeterministicPolicyEvaluator:
 
         # -------------------------------------------------------------
         # Rule C: Unknown Tool Privileged Access Guard
-        # Unknown tools must not receive privileged or destructive execution
         # -------------------------------------------------------------
         if not tool_spec.known:
             if tool_spec.privileged or is_destructive or action.action_type == ActionType.EXECUTE:
@@ -95,7 +128,7 @@ class DeterministicPolicyEvaluator:
 
         # -------------------------------------------------------------
         # Rule D: Normal Low-Risk Baseline
-        # Applies if no restrictive rules triggered
+        # Applies only if no restrictive rules triggered and intent didn't already match
         # -------------------------------------------------------------
         if not matched_rules:
             matched_rules.append(
@@ -107,10 +140,10 @@ class DeterministicPolicyEvaluator:
                 )
             )
 
-        # -------------------------------------------------------------
-        # Precedence Resolution
+        # =============================================================
+        # 3. Precedence Resolution
         # Precedence order: DENY > QUARANTINE > SANDBOX > REQUIRE_APPROVAL > ALLOW_WITH_LIMITS > ALLOW
-        # -------------------------------------------------------------
+        # =============================================================
         primary_match = max(matched_rules, key=lambda r: r.decision.severity_rank)
         resolved_decision = primary_match.decision
         resolved_reason = primary_match.reason
@@ -121,6 +154,7 @@ class DeterministicPolicyEvaluator:
         return SecurityDecision(
             action_id=action.action_id,
             session_id=action.session_id,
+            intent_contract_id=contract.intent_id if contract else None,
             decision=resolved_decision,
             reason=resolved_reason,
             matched_rules=rule_ids,

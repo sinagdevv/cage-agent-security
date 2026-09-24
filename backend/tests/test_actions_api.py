@@ -4,10 +4,44 @@ from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
+from app.intent.service import default_intent_service
+from app.schemas.enums import DataClassification, TargetEnvironment
+from app.schemas.intent import IntentContractCreate
+
+
+def test_api_evaluate_action_without_intent_denied_by_default(client: TestClient) -> None:
+    """Verify POST /api/v1/actions/evaluate denies unmanaged sessions by default (strict mode)."""
+    session_id = f"api-sess-{uuid4().hex[:6]}"
+    payload = {
+        "agent_id": "test-agent",
+        "session_id": session_id,
+        "tool_name": "web.search",
+        "tool_arguments": {"query": "CAGE architecture"},
+        "target_environment": "LOCAL",
+        "data_classifications": ["PUBLIC"],
+    }
+    response = client.post("/api/v1/actions/evaluate", json=payload)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["decision"] == "DENY"
+    assert "RULE_INTENT_MISSING" in data["matched_rules"]
+
 
 def test_api_evaluate_action_allow(client: TestClient) -> None:
-    """Verify POST /api/v1/actions/evaluate returns 200 and ALLOW for benign action."""
+    """Verify POST /api/v1/actions/evaluate returns 200 and ALLOW for benign action with active intent."""
     session_id = f"api-sess-{uuid4().hex[:6]}"
+    # Authorize session via control plane
+    default_intent_service.create_intent(
+        IntentContractCreate(
+            agent_id="test-agent",
+            session_id=session_id,
+            goal="API test research",
+            allowed_tools=["web.search"],
+            allowed_environments=[TargetEnvironment.LOCAL],
+            allowed_data_classifications=[DataClassification.PUBLIC],
+        )
+    )
+
     payload = {
         "agent_id": "test-agent",
         "session_id": session_id,
@@ -24,6 +58,7 @@ def test_api_evaluate_action_allow(client: TestClient) -> None:
     assert data["session_id"] == session_id
     assert "action_id" in data
     assert "matched_rules" in data
+    assert data["intent_contract_id"] is not None
 
 
 def test_api_evaluate_action_rejects_extra_fields(client: TestClient) -> None:
@@ -43,6 +78,14 @@ def test_api_evaluate_action_rejects_extra_fields(client: TestClient) -> None:
 def test_api_evaluate_action_rejects_missing_parent(client: TestClient) -> None:
     """Verify that referencing an unrecorded parent returns 400 Bad Request."""
     session_id = f"api-sess-{uuid4().hex[:6]}"
+    default_intent_service.create_intent(
+        IntentContractCreate(
+            agent_id="child-agent",
+            session_id=session_id,
+            goal="Parent test",
+            allowed_tools=["file.read"],
+        )
+    )
     payload = {
         "agent_id": "child-agent",
         "session_id": session_id,
@@ -58,6 +101,16 @@ def test_api_evaluate_action_rejects_missing_parent(client: TestClient) -> None:
 def test_api_get_action_and_session_graph(client: TestClient) -> None:
     """Verify GET /actions/{action_id} and GET /sessions/{session_id}/graph."""
     session_id = f"api-sess-{uuid4().hex[:6]}"
+    default_intent_service.create_intent(
+        IntentContractCreate(
+            agent_id="explorer",
+            session_id=session_id,
+            goal="Database exploration",
+            allowed_tools=["database.read"],
+            allowed_data_classifications=[DataClassification.PUBLIC, DataClassification.INTERNAL],
+        )
+    )
+
     # 1. Post action
     payload = {
         "agent_id": "explorer",
@@ -65,6 +118,7 @@ def test_api_get_action_and_session_graph(client: TestClient) -> None:
         "tool_name": "database.read",
         "tool_arguments": {"table": "customers"},
         "target_environment": "DEVELOPMENT",
+        "data_classifications": ["INTERNAL"],
     }
     eval_resp = client.post("/api/v1/actions/evaluate", json=payload)
     assert eval_resp.status_code == 200
@@ -83,7 +137,8 @@ def test_api_get_action_and_session_graph(client: TestClient) -> None:
     assert graph_resp.status_code == 200
     graph_data = graph_resp.json()
     assert graph_data["session_id"] == session_id
-    assert graph_data["node_count"] == 1
+    assert graph_data["node_count"] == 2  # 1 intent node + 1 action node
+    assert graph_data["edge_count"] == 1  # 1 governs edge
     assert graph_data["is_dag"] is True
 
 

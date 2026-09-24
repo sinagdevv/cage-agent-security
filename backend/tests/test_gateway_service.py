@@ -23,7 +23,7 @@ from app.schemas.enums import (
 @pytest.fixture
 def gateway() -> AgentGateway:
     manager = SessionGraphManager()
-    return AgentGateway(graph_manager=manager)
+    return AgentGateway(graph_manager=manager, require_intent=False)
 
 
 def test_gateway_allow_and_execute_flow(gateway: AgentGateway) -> None:

@@ -16,6 +16,9 @@ class SecurityDecision(BaseModel):
     )
     action_id: UUID = Field(..., description="Action UUID that was evaluated")
     session_id: str = Field(..., description="Execution session identifier")
+    intent_contract_id: UUID | None = Field(
+        default=None, description="Authoritative Intent Contract UUID governing this action"
+    )
     decision: PolicyDecision = Field(
         ..., description="Resolved policy decision (DENY, ALLOW, etc.)"
     )

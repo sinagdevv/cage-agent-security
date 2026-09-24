@@ -1,4 +1,4 @@
-"""Agent Gateway service coordinating action ingestion, graph recording, and policy evaluation."""
+"""Agent Gateway service coordinating action ingestion, graph recording, intent validation, and policy evaluation."""
 
 import logging
 from uuid import UUID
@@ -11,6 +11,7 @@ from app.graph.causal_graph import (
     SessionGraphManager,
     default_session_graph_manager,
 )
+from app.intent.service import IntentService, default_intent_service
 from app.policies.rules import DeterministicPolicyEvaluator, default_policy_evaluator
 from app.schemas.action import AgentAction, AgentActionProposal
 from app.schemas.decision import SecurityDecision
@@ -20,19 +21,27 @@ logger = logging.getLogger("cage.gateway")
 
 
 class AgentGateway:
-    """Core gateway mediating agent actions, recording causal graphs, and evaluating policies."""
+    """Core gateway mediating agent actions, recording causal graphs, and evaluating policies.
+
+    STRICT BY DEFAULT:
+    By default, require_intent=True mandates that actions must be authorized by an active Intent Contract.
+    """
 
     def __init__(
         self,
         graph_manager: SessionGraphManager | None = None,
         policy_evaluator: DeterministicPolicyEvaluator | None = None,
+        intent_service: IntentService | None = None,
         tool_registry: ToolRegistry | None = None,
         tool_executor: ToolExecutor | None = None,
+        require_intent: bool = True,
     ) -> None:
         self.graph_manager = graph_manager or default_session_graph_manager
         self.policy_evaluator = policy_evaluator or default_policy_evaluator
+        self.intent_service = intent_service or default_intent_service
         self.tool_registry = tool_registry or default_tool_registry
         self.tool_executor = tool_executor or default_tool_executor
+        self.require_intent = require_intent
 
     def evaluate_proposal(
         self, proposal: AgentActionProposal
@@ -40,22 +49,41 @@ class AgentGateway:
         """Ingest, validate, record in causal graph, and evaluate an AgentActionProposal.
 
         Lifecycle:
-        1. Validate parentage (reject missing or cross-session parent references).
-        2. Create authoritative AgentAction with server-generated UUID.
-        3. Record proposed action in graph (forensic trace preserved even if denied).
-        4. Link causal edge from parent action if present.
-        5. Evaluate deterministic policies using trusted ToolRegistry and precedence.
-        6. Update authoritative action and graph node with verdict and risk score.
-        7. Return authoritative action and SecurityDecision.
+        1. Look up authoritative Intent Contract bound to the session.
+        2. Validate causal parentage (reject missing or cross-session parent references).
+        3. Create authoritative AgentAction with server-generated UUID.
+        4. Record proposed action and Intent node in causal graph.
+        5. Link causal edges (Intent -> Action and Parent Action -> Current Action).
+        6. Evaluate unified Intent rules and runtime policies with precedence.
+        7. If ALLOWed, atomically reserve a tool execution budget slot.
+        8. Update action node in graph with final verdict and execution status.
+        9. Return authoritative action and SecurityDecision.
         """
         session_id = proposal.session_id
         graph = self.graph_manager.get_or_create(session_id)
 
-        # 1. Parent relationship validation
+        # 1. Authoritative server-side Intent Contract lookup
+        contract = self.intent_service.get_intent_for_session(session_id)
+
+        # Verify client correlation if client supplied an intent_contract_id
+        intent_mismatch = False
+        if proposal.intent_contract_id is not None:
+            try:
+                proposal_cid = (
+                    UUID(str(proposal.intent_contract_id))
+                    if not isinstance(proposal.intent_contract_id, UUID)
+                    else proposal.intent_contract_id
+                )
+            except (ValueError, TypeError):
+                proposal_cid = None
+
+            if contract is None or contract.intent_id != proposal_cid:
+                intent_mismatch = True
+
+        # 2. Parent relationship validation
         if proposal.parent_action_id is not None:
             parent_key = str(proposal.parent_action_id)
             if not graph.graph.has_node(parent_key):
-                # Check if parent exists in a different session
                 if self.graph_manager.get_action_globally(parent_key) is not None:
                     raise CrossSessionParentError(
                         f"Parent action '{parent_key}' belongs to a different session. "
@@ -65,7 +93,7 @@ class AgentGateway:
                     f"Parent action '{parent_key}' not found in session '{session_id}'."
                 )
 
-        # 2. Previous actions validation (if supplied)
+        # 3. Previous actions validation (if supplied)
         for prev_id in proposal.previous_action_ids:
             prev_key = str(prev_id)
             if not graph.graph.has_node(prev_key):
@@ -77,13 +105,35 @@ class AgentGateway:
                     f"Referenced previous action '{prev_key}' not found in session '{session_id}'."
                 )
 
-        # 3. Create server-authoritative AgentAction
+        # 4. Create server-authoritative AgentAction
         action = AgentAction.from_proposal(proposal)
+        if (
+            contract is not None
+            and contract.session_id == session_id
+            and contract.agent_id == proposal.agent_id
+            and not intent_mismatch
+        ):
+            action.intent_contract_id = contract.intent_id
+        else:
+            action.intent_contract_id = None
+
         action_key = str(action.action_id)
 
-        # 4. Record proposed action in graph BEFORE evaluation (forensic visibility)
+        # 5. Record Intent node and Action node in graph BEFORE evaluation (forensic visibility)
+        if contract is not None:
+            graph.add_intent_node(
+                intent_id=str(contract.intent_id),
+                goal=contract.goal,
+                agent_id=contract.agent_id,
+                user_id=contract.user_id,
+                created_at=contract.created_at.isoformat(),
+            )
+
         graph.add_action(action)
         self.graph_manager.register_action_session(action_key, session_id)
+
+        if contract is not None:
+            graph.add_governs_edge(str(contract.intent_id), action_key)
 
         if proposal.parent_action_id is not None:
             graph.add_relationship(str(proposal.parent_action_id), action_key, relation="causes")
@@ -91,10 +141,32 @@ class AgentGateway:
         for prev_id in proposal.previous_action_ids:
             graph.add_relationship(str(prev_id), action_key, relation="precedes")
 
-        # 5. Deterministic policy evaluation
-        decision = self.policy_evaluator.evaluate(action)
+        # 6. Policy evaluation (Unified Intent + Runtime Policies)
+        decision = self.policy_evaluator.evaluate(
+            action=action,
+            contract=contract,
+            require_intent=self.require_intent,
+            intent_mismatch=intent_mismatch,
+        )
 
-        # 6. Map verdict to execution status
+        # 7. Atomic Tool Execution Budget Reservation
+        # Only ALLOWed actions consume from the execution budget.
+        if decision.decision == PolicyDecision.ALLOW and contract is not None:
+            reserved = self.intent_service.reserve_tool_execution(contract.intent_id)
+            if not reserved:
+                # Quota exhausted by concurrent request or hit limit
+                decision = SecurityDecision(
+                    action_id=action.action_id,
+                    session_id=action.session_id,
+                    intent_contract_id=contract.intent_id,
+                    decision=PolicyDecision.DENY,
+                    reason=f"Tool call budget exceeded: {contract.tool_calls_count}/{contract.maximum_tool_calls} executions consumed.",
+                    matched_rules=decision.matched_rules + ["RULE_TOOL_BUDGET_EXCEEDED"],
+                    risk_score=0.85,
+                    requires_human_approval=False,
+                )
+
+        # 8. Map verdict to execution status
         if decision.decision == PolicyDecision.ALLOW:
             execution_status = ToolExecutionStatus.AUTHORIZED
         elif decision.decision == PolicyDecision.REQUIRE_APPROVAL:
@@ -102,7 +174,7 @@ class AgentGateway:
         else:
             execution_status = ToolExecutionStatus.DENIED
 
-        # 7. Update action state in graph and internal storage
+        # 9. Update action state in graph and internal storage
         graph.update_action_state(
             action_id=action_key,
             execution_status=execution_status,
@@ -113,11 +185,12 @@ class AgentGateway:
         )
 
         logger.info(
-            "Action evaluated: action_id=%s tool=%s decision=%s rules=%s",
+            "Action evaluated: action_id=%s tool=%s decision=%s rules=%s intent=%s",
             action.action_id,
             action.tool_name,
             decision.decision.value,
             decision.matched_rules,
+            decision.intent_contract_id,
         )
 
         return action, decision
@@ -151,10 +224,10 @@ class AgentGateway:
             session_id=action.session_id,
         )
 
-        # Synthesize a decision check for the tool executor
         decision = SecurityDecision(
             action_id=action.action_id,
             session_id=action.session_id,
+            intent_contract_id=action.intent_contract_id,
             decision=action.policy_result,
             reason=action.security_reason or "Authorized",
             matched_rules=action.matched_rules,
@@ -181,5 +254,5 @@ class AgentGateway:
             raise
 
 
-# Global default gateway instance
-default_agent_gateway = AgentGateway()
+# Global default gateway instance (Strict by default)
+default_agent_gateway = AgentGateway(require_intent=True)

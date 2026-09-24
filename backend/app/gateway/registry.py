@@ -5,6 +5,8 @@ Prevents AI agents from spoofing destructive, privileged, or external-sink attri
 
 from dataclasses import dataclass
 
+from app.schemas.enums import DataClassification
+
 
 @dataclass(frozen=True)
 class ToolSpec:
@@ -15,6 +17,8 @@ class ToolSpec:
     privileged: bool = False
     destructive: bool = False
     external_sink: bool = False
+    resource_scoped: bool = False
+    default_classification: DataClassification | None = None
     description: str = ""
 
 
@@ -26,7 +30,7 @@ class ToolRegistry:
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
-        """Register the standard Phase 1 simulated tools."""
+        """Register the standard Phase 1 and Phase 2 simulated tools."""
         defaults = [
             ToolSpec(
                 name="web.search",
@@ -34,6 +38,8 @@ class ToolRegistry:
                 privileged=False,
                 destructive=False,
                 external_sink=False,
+                resource_scoped=False,
+                default_classification=DataClassification.PUBLIC,
                 description="Search public web information",
             ),
             ToolSpec(
@@ -42,6 +48,8 @@ class ToolRegistry:
                 privileged=False,
                 destructive=False,
                 external_sink=False,
+                resource_scoped=True,
+                default_classification=None,
                 description="Read local file contents",
             ),
             ToolSpec(
@@ -50,6 +58,8 @@ class ToolRegistry:
                 privileged=False,
                 destructive=False,
                 external_sink=False,
+                resource_scoped=True,
+                default_classification=None,
                 description="Write to local file path",
             ),
             ToolSpec(
@@ -58,6 +68,8 @@ class ToolRegistry:
                 privileged=True,
                 destructive=False,
                 external_sink=False,
+                resource_scoped=True,
+                default_classification=DataClassification.INTERNAL,
                 description="Query internal database tables",
             ),
             ToolSpec(
@@ -66,6 +78,8 @@ class ToolRegistry:
                 privileged=False,
                 destructive=False,
                 external_sink=True,
+                resource_scoped=True,
+                default_classification=None,
                 description="Transmit HTTP payload to external endpoint",
             ),
             ToolSpec(
@@ -74,6 +88,8 @@ class ToolRegistry:
                 privileged=True,
                 destructive=True,
                 external_sink=False,
+                resource_scoped=True,
+                default_classification=None,
                 description="Delete a system or cloud resource",
             ),
         ]
@@ -83,7 +99,7 @@ class ToolRegistry:
     def get(self, tool_name: str) -> ToolSpec:
         """Retrieve authoritative ToolSpec.
 
-        Unknown tools default to a conservative classification (untrusted/privileged).
+        Unknown tools default to a conservative classification (untrusted/privileged/resource-scoped).
         """
         if tool_name in self._tools:
             return self._tools[tool_name]
@@ -93,6 +109,7 @@ class ToolRegistry:
             privileged=True,
             destructive=False,
             external_sink=False,
+            resource_scoped=True,
             description="Unknown tool - defaulting to conservative security bounds",
         )
 
@@ -103,6 +120,19 @@ class ToolRegistry:
     def register(self, spec: ToolSpec) -> None:
         """Register or override a tool spec (primarily for testing)."""
         self._tools[spec.name] = spec
+
+    def get_effective_classifications(
+        self, tool_name: str, client_classifications: list[DataClassification]
+    ) -> list[DataClassification]:
+        """Compute effective classifications via server_known UNION client_declared.
+
+        Prevents agents from downgrading known sensitive tools/data to PUBLIC.
+        """
+        spec = self.get(tool_name)
+        effective = set(client_classifications)
+        if spec.default_classification is not None:
+            effective.add(spec.default_classification)
+        return list(effective)
 
 
 # Global default instance

@@ -33,7 +33,7 @@ class AgentActionProposal(BaseModel):
     agent_instance_id: str | None = Field(default=None, description="Ephemeral runtime instance ID")
     session_id: str = Field(..., description="Causal execution session identifier")
     user_id: str | None = Field(default=None, description="Initiating human user identifier")
-    intent_contract_id: str | None = Field(
+    intent_contract_id: UUID | str | None = Field(
         default=None, description="Reference to root intent agreement"
     )
 
@@ -100,7 +100,7 @@ class AgentAction(BaseModel):
     agent_instance_id: str | None = None
     session_id: str
     user_id: str | None = None
-    intent_contract_id: str | None = None
+    intent_contract_id: UUID | str | None = None
 
     goal: str | None = None
     current_task: str | None = None

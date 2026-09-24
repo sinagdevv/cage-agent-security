@@ -84,3 +84,12 @@ class TargetEnvironment(StrEnum):
     DEVELOPMENT = "DEVELOPMENT"
     STAGING = "STAGING"
     PRODUCTION = "PRODUCTION"
+
+
+class IntentStatus(StrEnum):
+    """Lifecycle state of an Intent Contract."""
+
+    ACTIVE = "ACTIVE"
+    EXPIRED = "EXPIRED"
+    REVOKED = "REVOKED"
+    COMPLETED = "COMPLETED"

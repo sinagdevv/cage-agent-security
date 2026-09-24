@@ -64,6 +64,33 @@ class CausalExecutionGraph:
         meta = metadata or {}
         self._graph.add_edge(source_id, target_id, relation=relation, **meta)
 
+    def add_intent_node(
+        self,
+        intent_id: str,
+        goal: str,
+        agent_id: str,
+        user_id: str | None = None,
+        created_at: str | None = None,
+    ) -> None:
+        """Record an Intent Contract as a root governance node."""
+        if not self._graph.has_node(intent_id):
+            self._graph.add_node(
+                intent_id,
+                node_type="intent",
+                goal=goal,
+                agent_id=agent_id,
+                user_id=user_id,
+                created_at=created_at or datetime.now(UTC).isoformat(),
+            )
+
+    def add_governs_edge(self, intent_id: str, action_id: str) -> None:
+        """Link an Intent Contract to an action it governs."""
+        if not self._graph.has_node(intent_id):
+            raise KeyError(f"Intent node '{intent_id}' does not exist in session graph.")
+        if not self._graph.has_node(action_id):
+            raise KeyError(f"Action node '{action_id}' does not exist in session graph.")
+        self._graph.add_edge(intent_id, action_id, relation="governs")
+
     def add_action(self, action: AgentAction) -> None:
         """Record an authoritative AgentAction as a node in the causal graph.
 
@@ -87,6 +114,9 @@ class CausalExecutionGraph:
             execution_status=action.execution_status.value,
             policy_result=action.policy_result.value if action.policy_result else None,
             risk_score=action.risk_score,
+            intent_contract_id=str(action.intent_contract_id)
+            if action.intent_contract_id
+            else None,
             created_at=action.created_at.isoformat(),
         )
 
@@ -176,20 +206,29 @@ class CausalExecutionGraph:
         """Serialize current session trajectory graph to JSON-friendly representation."""
         nodes = []
         for node_id, data in self._graph.nodes(data=True):
-            nodes.append(
-                {
-                    "id": node_id,
-                    "node_type": data.get("node_type", "action"),
-                    "agent_id": data.get("agent_id"),
-                    "tool_name": data.get("tool_name"),
-                    "action_type": data.get("action_type"),
-                    "target_environment": data.get("target_environment"),
-                    "execution_status": data.get("execution_status"),
-                    "policy_result": data.get("policy_result"),
-                    "risk_score": data.get("risk_score"),
-                    "created_at": data.get("created_at"),
-                }
-            )
+            node_type = data.get("node_type", "action")
+            node_info: dict[str, Any] = {
+                "id": node_id,
+                "node_type": node_type,
+                "agent_id": data.get("agent_id"),
+                "created_at": data.get("created_at"),
+            }
+            if node_type == "intent":
+                node_info["goal"] = data.get("goal")
+                node_info["user_id"] = data.get("user_id")
+            else:
+                node_info.update(
+                    {
+                        "tool_name": data.get("tool_name"),
+                        "action_type": data.get("action_type"),
+                        "target_environment": data.get("target_environment"),
+                        "execution_status": data.get("execution_status"),
+                        "policy_result": data.get("policy_result"),
+                        "risk_score": data.get("risk_score"),
+                        "intent_contract_id": data.get("intent_contract_id"),
+                    }
+                )
+            nodes.append(node_info)
 
         edges = []
         for u, v, data in self._graph.edges(data=True):
