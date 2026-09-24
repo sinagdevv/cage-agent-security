@@ -1,0 +1,102 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backend
+    container_name: cage-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - CAGE_ENV=development
+      - CAGE_DEBUG=true
+      - CAGE_HOST=0.0.0.0
+      - CAGE_PORT=8000
+      - DATABASE_URL=postgresql+psycopg://cage_user:cage_password@postgres:5432/cage_db
+      - REDIS_URL=redis://redis:6379/0
+      - OPA_URL=http://opa:8181
+    volumes:
+      - ./backend:/app/backend
+      - ./pyproject.toml:/app/pyproject.toml
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      opa:
+        condition: service_started
+    networks:
+      - cage-network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: ../docker/Dockerfile.frontend
+    container_name: cage-frontend
+    restart: unless-stopped
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_URL=http://localhost:8000
+      - VITE_WS_URL=ws://localhost:8000/ws
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    networks:
+      - cage-network
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: cage-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: cage_user
+      POSTGRES_PASSWORD: cage_password
+      POSTGRES_DB: cage_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cage_user -d cage_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - cage-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: cage-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - cage-network
+
+  opa:
+    image: openpolicyagent/opa:0.68.0-debug
+    container_name: cage-opa
+    restart: unless-stopped
+    ports:
+      - "8181:8181"
+    command:
+      - "run"
+      - "--server"
+      - "--log-level=info"
+      - "--addr=0.0.0.0:8181"
+      - "/policies"
+    volumes:
+      - ./policies:/policies:ro
+    networks:
+      - cage-network
+
+networks:
+  cage-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
