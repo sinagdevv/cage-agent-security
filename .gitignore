@@ -68,3 +68,11 @@ frontend/.vite/
 *~
 .DS_Store
 Thumbs.db
+
+# Attack Lab Generated Reports
+attack_lab/reports/*.json
+attack_lab/reports/*.md
+!attack_lab/reports/sample_attack_report.md
+!attack_lab/reports/.gitkeep
+
+
