@@ -73,6 +73,7 @@ class DataClassification(StrEnum):
     INTERNAL = "INTERNAL"
     CONFIDENTIAL = "CONFIDENTIAL"
     RESTRICTED = "RESTRICTED"
+    PII = "PII"
     SECRET = "SECRET"
     CREDENTIAL = "CREDENTIAL"
 
@@ -120,3 +121,27 @@ class OpaStatus(StrEnum):
     UNAVAILABLE = "UNAVAILABLE"
     INVALID_RESPONSE = "INVALID_RESPONSE"
     EVALUATION_ERROR = "EVALUATION_ERROR"
+
+
+class GraphNodeType(StrEnum):
+    """Standardized node types within the CAGE causal execution graph."""
+
+    INTENT = "intent"
+    ACTION = "action"
+
+
+class GraphRelation(StrEnum):
+    """Standardized directed edge relations within the CAGE causal execution graph."""
+
+    GOVERNS = "governs"
+    CAUSES = "causes"
+
+
+class GraphAnalysisStatus(StrEnum):
+    """Outcome status of graph security analysis and traversal."""
+
+    SUCCESS = "SUCCESS"
+    DEPTH_LIMIT_EXCEEDED = "DEPTH_LIMIT_EXCEEDED"
+    NODE_LIMIT_EXCEEDED = "NODE_LIMIT_EXCEEDED"
+    INVALID_GRAPH = "INVALID_GRAPH"
+    CYCLE_DETECTED = "CYCLE_DETECTED"

@@ -28,8 +28,14 @@ try:
         opa_url: str = os.getenv("OPA_URL", "http://localhost:8181")
         opa_timeout_seconds: float = float(os.getenv("OPA_TIMEOUT_SECONDS", "2.0"))
         policy_backend: str = os.getenv("CAGE_POLICY_BACKEND", "SHADOW")
-        policy_version: str = os.getenv("CAGE_POLICY_VERSION", "phase3-v1")
-        policy_input_schema_version: str = "cage-policy-input-v1"
+        policy_version: str = os.getenv("CAGE_POLICY_VERSION", "phase4-v1")
+        policy_input_schema_version: str = "cage-policy-input-v2"
+
+        max_graph_depth: int = int(os.getenv("CAGE_MAX_GRAPH_DEPTH", "25"))
+        max_graph_nodes_per_analysis: int = int(
+            os.getenv("CAGE_MAX_GRAPH_NODES_PER_ANALYSIS", "500")
+        )
+        privilege_probing_threshold: int = int(os.getenv("CAGE_PRIVILEGE_PROBING_THRESHOLD", "3"))
 
         secret_key: str = os.getenv("CAGE_SECRET_KEY", "dev-secret-key-change-in-production")
         api_key: str | None = os.getenv("CAGE_API_KEY", "cage_dev_test_api_key")
@@ -54,8 +60,14 @@ except ImportError:
         opa_url: str = os.getenv("OPA_URL", "http://localhost:8181")
         opa_timeout_seconds: float = float(os.getenv("OPA_TIMEOUT_SECONDS", "2.0"))
         policy_backend: str = os.getenv("CAGE_POLICY_BACKEND", "SHADOW")
-        policy_version: str = os.getenv("CAGE_POLICY_VERSION", "phase3-v1")
-        policy_input_schema_version: str = "cage-policy-input-v1"
+        policy_version: str = os.getenv("CAGE_POLICY_VERSION", "phase4-v1")
+        policy_input_schema_version: str = "cage-policy-input-v2"
+
+        max_graph_depth: int = int(os.getenv("CAGE_MAX_GRAPH_DEPTH", "25"))
+        max_graph_nodes_per_analysis: int = int(
+            os.getenv("CAGE_MAX_GRAPH_NODES_PER_ANALYSIS", "500")
+        )
+        privilege_probing_threshold: int = int(os.getenv("CAGE_PRIVILEGE_PROBING_THRESHOLD", "3"))
 
         secret_key: str = os.getenv("CAGE_SECRET_KEY", "dev-secret-key-change-in-production")
         api_key: str | None = os.getenv("CAGE_API_KEY", "cage_dev_test_api_key")

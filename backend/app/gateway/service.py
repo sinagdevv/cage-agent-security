@@ -5,6 +5,7 @@ from uuid import UUID
 
 from app.gateway.registry import ToolRegistry, default_tool_registry
 from app.gateway.tools import ToolExecutor, ToolRequest, ToolResult, default_tool_executor
+from app.graph.analyzer import GraphSecurityAnalyzer, default_graph_security_analyzer
 from app.graph.causal_graph import (
     CrossSessionParentError,
     ParentActionNotFoundError,
@@ -17,7 +18,7 @@ from app.policies.policy_input import build_cage_policy_input
 from app.policies.rules import DeterministicPolicyEvaluator
 from app.schemas.action import AgentAction, AgentActionProposal
 from app.schemas.decision import SecurityDecision
-from app.schemas.enums import PolicyBackend, PolicyDecision, ToolExecutionStatus
+from app.schemas.enums import GraphRelation, PolicyBackend, PolicyDecision, ToolExecutionStatus
 
 logger = logging.getLogger("cage.gateway")
 
@@ -37,12 +38,14 @@ class AgentGateway:
         intent_service: IntentService | None = None,
         tool_registry: ToolRegistry | None = None,
         tool_executor: ToolExecutor | None = None,
+        graph_analyzer: GraphSecurityAnalyzer | None = None,
         require_intent: bool = True,
     ) -> None:
         self.graph_manager = graph_manager or default_session_graph_manager
         self.intent_service = intent_service or default_intent_service
         self.tool_registry = tool_registry or default_tool_registry
         self.tool_executor = tool_executor or default_tool_executor
+        self.graph_analyzer = graph_analyzer or default_graph_security_analyzer
         self.require_intent = require_intent
 
         if policy_engine is not None:
@@ -143,35 +146,61 @@ class AgentGateway:
                 created_at=contract.created_at.isoformat(),
             )
 
-        graph.add_action(action)
+        # Look up tool spec and effective classifications for snapshotted metadata
+        tool_spec = self.tool_registry.get(action.tool_name)
+        effective_classifications = [
+            c.value
+            for c in self.tool_registry.get_effective_classifications(
+                action.tool_name, action.data_classifications
+            )
+        ]
+
+        graph.add_action(
+            action,
+            tool_spec=tool_spec,
+            effective_data_classifications=effective_classifications,
+            policy_version=self.policy_engine.policy_version,
+            policy_input_schema_version=self.policy_engine.schema_version,
+        )
         self.graph_manager.register_action_session(action_key, session_id)
 
         if contract is not None:
             graph.add_governs_edge(str(contract.intent_id), action_key)
 
         if proposal.parent_action_id is not None:
-            graph.add_relationship(str(proposal.parent_action_id), action_key, relation="causes")
+            graph.add_relationship(
+                str(proposal.parent_action_id), action_key, relation=GraphRelation.CAUSES
+            )
 
         for prev_id in proposal.previous_action_ids:
             graph.add_relationship(str(prev_id), action_key, relation="precedes")
 
-        # 6. Build single canonical CagePolicyInput document
+        # 6. Derive authoritative graph security context
+        graph_context = self.graph_analyzer.analyze_action_causality(
+            graph=graph,
+            parent_action_id=str(proposal.parent_action_id)
+            if proposal.parent_action_id is not None
+            else None,
+        )
+
+        # 7. Build single canonical CagePolicyInput document
         policy_input = build_cage_policy_input(
             action=action,
             contract=contract,
             tool_registry=self.tool_registry,
             require_intent=self.require_intent,
             intent_mismatch=intent_mismatch,
+            graph_context=graph_context,
         )
 
-        # 7. Policy evaluation (Unified Python / OPA via PolicyEngine)
+        # 8. Policy evaluation (Unified Python / OPA via PolicyEngine)
         decision, parity_result = self.policy_engine.evaluate(
             policy_input=policy_input,
             action=action,
             contract=contract,
         )
 
-        # 8. Atomic Tool Execution Budget Reservation
+        # 9. Atomic Tool Execution Budget Reservation
         # Only ALLOWed actions consume from the execution budget.
         if decision.decision == PolicyDecision.ALLOW and contract is not None:
             reserved = self.intent_service.reserve_tool_execution(contract.intent_id)
@@ -191,7 +220,7 @@ class AgentGateway:
                     policy_input_schema_version=decision.policy_input_schema_version,
                 )
 
-        # 9. Map verdict to execution status
+        # 10. Map verdict to execution status
         if decision.decision == PolicyDecision.ALLOW:
             execution_status = ToolExecutionStatus.AUTHORIZED
         elif decision.decision == PolicyDecision.REQUIRE_APPROVAL:
@@ -199,7 +228,7 @@ class AgentGateway:
         else:
             execution_status = ToolExecutionStatus.DENIED
 
-        # 10. Update action state in graph and internal storage
+        # 11. Update action state in graph and internal storage
         graph.update_action_state(
             action_id=action_key,
             execution_status=execution_status,
@@ -207,6 +236,8 @@ class AgentGateway:
             security_reason=decision.reason,
             matched_rules=decision.matched_rules,
             risk_score=decision.risk_score,
+            policy_version=decision.policy_version,
+            policy_input_schema_version=decision.policy_input_schema_version,
         )
 
         logger.info(

@@ -15,7 +15,7 @@ from typing import Any
 import networkx as nx
 
 from app.schemas.action import AgentAction
-from app.schemas.enums import PolicyDecision, ToolExecutionStatus
+from app.schemas.enums import GraphNodeType, GraphRelation, PolicyDecision, ToolExecutionStatus
 
 
 class ActionCollisionError(ValueError):
@@ -28,6 +28,14 @@ class ParentActionNotFoundError(ValueError):
 
 class CrossSessionParentError(ValueError):
     """Raised when a parent action belongs to a different session."""
+
+
+class GraphCycleError(ValueError):
+    """Raised when adding a causal edge would violate the DAG invariant by creating a cycle."""
+
+
+class GraphTraversalLimitError(ValueError):
+    """Raised when a graph traversal exceeds configured depth or node limits."""
 
 
 class CausalExecutionGraph:
@@ -57,12 +65,20 @@ class CausalExecutionGraph:
         self,
         source_id: str,
         target_id: str,
-        relation: str = "causes",
+        relation: GraphRelation | str = GraphRelation.CAUSES,
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        """Add a directed causal relation between two nodes."""
+        """Add a directed causal relation between two nodes with cycle prevention."""
+        rel_str = relation.value if isinstance(relation, GraphRelation) else str(relation)
+        if rel_str == GraphRelation.CAUSES.value or rel_str == "causes":
+            if self._graph.has_node(target_id) and self._graph.has_node(source_id):
+                if nx.has_path(self._graph, target_id, source_id):
+                    raise GraphCycleError(
+                        f"Causal cycle detected: adding causal edge from '{source_id}' to '{target_id}' "
+                        f"would create a directed cycle in session '{self.session_id}'."
+                    )
         meta = metadata or {}
-        self._graph.add_edge(source_id, target_id, relation=relation, **meta)
+        self._graph.add_edge(source_id, target_id, relation=rel_str, **meta)
 
     def add_intent_node(
         self,
@@ -76,7 +92,7 @@ class CausalExecutionGraph:
         if not self._graph.has_node(intent_id):
             self._graph.add_node(
                 intent_id,
-                node_type="intent",
+                node_type=GraphNodeType.INTENT.value,
                 goal=goal,
                 agent_id=agent_id,
                 user_id=user_id,
@@ -89,10 +105,17 @@ class CausalExecutionGraph:
             raise KeyError(f"Intent node '{intent_id}' does not exist in session graph.")
         if not self._graph.has_node(action_id):
             raise KeyError(f"Action node '{action_id}' does not exist in session graph.")
-        self._graph.add_edge(intent_id, action_id, relation="governs")
+        self._graph.add_edge(intent_id, action_id, relation=GraphRelation.GOVERNS.value)
 
-    def add_action(self, action: AgentAction) -> None:
-        """Record an authoritative AgentAction as a node in the causal graph.
+    def add_action(
+        self,
+        action: AgentAction,
+        tool_spec: Any | None = None,
+        effective_data_classifications: list[str] | None = None,
+        policy_version: str | None = None,
+        policy_input_schema_version: str | None = None,
+    ) -> None:
+        """Record an authoritative AgentAction with snapshotted security attributes in graph.
 
         Raises ActionCollisionError if the action_id already exists to prevent
         historical mutation.
@@ -104,19 +127,45 @@ class CausalExecutionGraph:
             )
 
         self._actions[action_key] = action
+
+        # Snapshot security facts at action ingestion time
+        known = tool_spec.known if tool_spec is not None else True
+        privileged = tool_spec.privileged if tool_spec is not None else False
+        destructive = (
+            tool_spec.destructive
+            if tool_spec is not None
+            else (action.action_type.value == "DESTRUCTIVE")
+        )
+        external_sink = tool_spec.external_sink if tool_spec is not None else False
+        eff_classifications = (
+            effective_data_classifications
+            if effective_data_classifications is not None
+            else [c.value for c in action.data_classifications]
+        )
+
         self._graph.add_node(
             action_key,
-            node_type="action",
+            node_type=GraphNodeType.ACTION.value,
+            action_id=action_key,
             agent_id=action.agent_id,
+            session_id=action.session_id,
             tool_name=action.tool_name,
+            tool_known=known,
+            tool_privileged=privileged,
+            tool_destructive=destructive,
+            tool_external_sink=external_sink,
             action_type=action.action_type.value,
+            target_resource=action.target_resource,
             target_environment=action.target_environment.value,
+            effective_data_classifications=list(eff_classifications),
             execution_status=action.execution_status.value,
             policy_result=action.policy_result.value if action.policy_result else None,
             risk_score=action.risk_score,
             intent_contract_id=str(action.intent_contract_id)
             if action.intent_contract_id
             else None,
+            policy_version=policy_version,
+            policy_input_schema_version=policy_input_schema_version,
             created_at=action.created_at.isoformat(),
         )
 
@@ -129,6 +178,8 @@ class CausalExecutionGraph:
         matched_rules: list[str] | None = None,
         risk_score: float | None = None,
         execution_result: dict[str, Any] | None = None,
+        policy_version: str | None = None,
+        policy_input_schema_version: str | None = None,
     ) -> None:
         """Update the state of an existing action node following evaluation or execution."""
         if action_id not in self._actions:
@@ -157,26 +208,73 @@ class CausalExecutionGraph:
             node_attrs["risk_score"] = risk_score
         if execution_result is not None:
             node_attrs["has_execution_result"] = True
+        if policy_version is not None:
+            node_attrs["policy_version"] = policy_version
+        if policy_input_schema_version is not None:
+            node_attrs["policy_input_schema_version"] = policy_input_schema_version
 
     def add_relationship(
         self,
         source_id: str,
         target_id: str,
-        relation: str = "causes",
+        relation: GraphRelation | str = GraphRelation.CAUSES,
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        """Add a directed causal relation between two existing nodes."""
+        """Add a directed causal relation between two existing nodes with cycle prevention."""
         if not self._graph.has_node(source_id):
             raise ParentActionNotFoundError(f"Source action '{source_id}' does not exist in graph.")
         if not self._graph.has_node(target_id):
             raise KeyError(f"Target action '{target_id}' does not exist in graph.")
 
+        rel_str = relation.value if isinstance(relation, GraphRelation) else str(relation)
+        if rel_str == GraphRelation.CAUSES.value or rel_str == "causes":
+            if nx.has_path(self._graph, target_id, source_id):
+                raise GraphCycleError(
+                    f"Causal cycle detected: adding causal edge from '{source_id}' to '{target_id}' "
+                    f"would create a directed cycle in session '{self.session_id}'."
+                )
+
         meta = metadata or {}
-        self._graph.add_edge(source_id, target_id, relation=relation, **meta)
+        self._graph.add_edge(source_id, target_id, relation=rel_str, **meta)
 
     def get_action(self, action_id: str) -> AgentAction | None:
-        """Retrieve authoritative AgentAction by ID."""
-        return self._actions.get(action_id)
+        """Retrieve authoritative AgentAction by ID as an immutable safe copy."""
+        act = self._actions.get(action_id)
+        if act is None:
+            return None
+        return act.model_copy(deep=True)
+
+    def get_node_data(self, node_id: str) -> dict[str, Any] | None:
+        """Retrieve copy of node attributes dictionary."""
+        if not self._graph.has_node(node_id):
+            return None
+        return dict(self._graph.nodes[node_id])
+
+    def get_parents(self, action_id: str) -> list[str]:
+        """Retrieve direct causal parent action IDs (incoming edges with relation='causes')."""
+        if not self._graph.has_node(action_id):
+            return []
+        parents = []
+        for u, _, data in self._graph.in_edges(action_id, data=True):
+            if (
+                data.get("relation") == GraphRelation.CAUSES.value
+                or data.get("relation") == "causes"
+            ):
+                parents.append(u)
+        return parents
+
+    def get_children(self, action_id: str) -> list[str]:
+        """Retrieve direct causal child action IDs (outgoing edges with relation='causes')."""
+        if not self._graph.has_node(action_id):
+            return []
+        children = []
+        for _, v, data in self._graph.out_edges(action_id, data=True):
+            if (
+                data.get("relation") == GraphRelation.CAUSES.value
+                or data.get("relation") == "causes"
+            ):
+                children.append(v)
+        return children
 
     def get_ancestors(self, node_id: str) -> list[str]:
         """Retrieve all ancestor node IDs that causally influenced the specified node."""
@@ -189,6 +287,70 @@ class CausalExecutionGraph:
         if not self._graph.has_node(node_id):
             return []
         return list(nx.descendants(self._graph, node_id))
+
+    def get_shortest_path(self, source_id: str, target_id: str) -> list[str]:
+        """Compute shortest directed path node IDs between source and target."""
+        if not self._graph.has_node(source_id) or not self._graph.has_node(target_id):
+            return []
+        try:
+            return list(nx.shortest_path(self._graph, source_id, target_id))
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            return []
+
+    def has_path(self, source_id: str, target_id: str) -> bool:
+        """Check if a directed path exists from source to target."""
+        if not self._graph.has_node(source_id) or not self._graph.has_node(target_id):
+            return False
+        return bool(nx.has_path(self._graph, source_id, target_id))
+
+    def get_action_ancestors(self, action_id: str) -> list[AgentAction]:
+        """Retrieve all causal ancestor AgentActions in topological order (oldest to newest).
+
+        Returns safe copies to prevent external mutation of graph history.
+        """
+        if not self._graph.has_node(action_id):
+            return []
+
+        # Find all ancestors reachable via incoming 'causes' edges
+        stack = self.get_parents(action_id)
+        ancestor_ids = set()
+
+        while stack:
+            curr = stack.pop()
+            if curr in ancestor_ids:
+                continue
+            ancestor_ids.add(curr)
+            for p in self.get_parents(curr):
+                if p not in ancestor_ids:
+                    stack.append(p)
+
+        if not ancestor_ids:
+            return []
+
+        # Subgraph of ancestors for topological sorting
+        sub = self._graph.subgraph(ancestor_ids)
+        try:
+            ordered_ids = list(nx.topological_sort(sub))
+        except nx.NetworkXUnfeasible:
+            ordered_ids = sorted(list(ancestor_ids))
+
+        result = []
+        for aid in ordered_ids:
+            act = self._actions.get(aid)
+            if act is not None:
+                result.append(act.model_copy(deep=True))
+        return result
+
+    def get_tool_history(self, action_id: str) -> list[str]:
+        """Retrieve tool names along the causal ancestry path in topological order."""
+        ancestor_actions = self.get_action_ancestors(action_id)
+        return [act.tool_name for act in ancestor_actions]
+
+    def get_recent_ancestor_actions(self, action_id: str, limit: int = 5) -> list[AgentAction]:
+        """Retrieve the most recent N ancestor AgentActions (closest to action_id first)."""
+        ancestors = self.get_action_ancestors(action_id)
+        # Reverse topological sort gives immediate parent first
+        return list(reversed(ancestors))[:limit]
 
     def node_count(self) -> int:
         """Return total number of nodes in the graph."""
@@ -206,26 +368,35 @@ class CausalExecutionGraph:
         """Serialize current session trajectory graph to JSON-friendly representation."""
         nodes = []
         for node_id, data in self._graph.nodes(data=True):
-            node_type = data.get("node_type", "action")
+            node_type = data.get("node_type", GraphNodeType.ACTION.value)
             node_info: dict[str, Any] = {
                 "id": node_id,
                 "node_type": node_type,
                 "agent_id": data.get("agent_id"),
                 "created_at": data.get("created_at"),
             }
-            if node_type == "intent":
+            if node_type == GraphNodeType.INTENT.value or node_type == "intent":
                 node_info["goal"] = data.get("goal")
                 node_info["user_id"] = data.get("user_id")
             else:
                 node_info.update(
                     {
                         "tool_name": data.get("tool_name"),
+                        "tool_known": data.get("tool_known", True),
+                        "tool_privileged": data.get("tool_privileged", False),
+                        "tool_destructive": data.get("tool_destructive", False),
+                        "tool_external_sink": data.get("tool_external_sink", False),
                         "action_type": data.get("action_type"),
                         "target_environment": data.get("target_environment"),
+                        "effective_data_classifications": data.get(
+                            "effective_data_classifications", []
+                        ),
                         "execution_status": data.get("execution_status"),
                         "policy_result": data.get("policy_result"),
                         "risk_score": data.get("risk_score"),
                         "intent_contract_id": data.get("intent_contract_id"),
+                        "policy_version": data.get("policy_version"),
+                        "policy_input_schema_version": data.get("policy_input_schema_version"),
                     }
                 )
             nodes.append(node_info)
@@ -236,7 +407,7 @@ class CausalExecutionGraph:
                 {
                     "source": u,
                     "target": v,
-                    "relation": data.get("relation", "causes"),
+                    "relation": data.get("relation", GraphRelation.CAUSES.value),
                 }
             )
 

@@ -1,6 +1,7 @@
 package cage.authorization
 
 import data.cage.data_flow
+import data.cage.graph
 import data.cage.intent
 import data.cage.resource
 import data.cage.runtime
@@ -20,6 +21,10 @@ matched_findings[f] {
 
 matched_findings[f] {
     f := runtime.findings[_]
+}
+
+matched_findings[f] {
+    f := graph.findings[_]
 }
 
 # Export array of findings

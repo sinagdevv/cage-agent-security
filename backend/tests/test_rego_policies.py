@@ -11,16 +11,19 @@ import pytest
 from app.gateway.registry import ToolRegistry, ToolSpec
 from app.policies.opa_client import OpaClient
 from app.policies.policy_input import build_cage_policy_input
+from app.policies.rules import DeterministicPolicyEvaluator
 from app.schemas.action import AgentAction
 from app.schemas.enums import (
     ActionType,
     DataClassification,
+    GraphAnalysisStatus,
     OpaStatus,
     PolicyDecision,
     TargetEnvironment,
     TrustLevel,
 )
 from app.schemas.intent import IntentContract, IntentContractCreate
+from app.schemas.policy import PolicyGraphContext
 
 
 @pytest.fixture
@@ -195,3 +198,423 @@ def test_live_rego_production_destructive(live_opa_client: OpaClient) -> None:
     assert res.status == OpaStatus.SUCCESS
     rule_ids = [f.rule_id for f in res.findings]
     assert "RULE_A_PRODUCTION_DESTRUCTIVE" in rule_ids
+
+
+@pytest.mark.opa
+def test_live_rego_graph_sensitive_ancestry_confidential_and_pii(
+    live_opa_client: OpaClient,
+) -> None:
+    """Requirement 2 & 7: Verify live OPA denies external transmission following CONFIDENTIAL/PII access."""
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="external.http_post",
+            description="External HTTP sink",
+            external_sink=True,
+        )
+    )
+    action = AgentAction(
+        action_id=uuid4(),
+        agent_id="agent-01",
+        session_id="session-live-g1",
+        tool_name="external.http_post",
+        action_type=ActionType.TOOL_CALL,
+        target_environment=TargetEnvironment.DEVELOPMENT,
+        data_classifications=[DataClassification.PUBLIC],
+        input_trust_level=TrustLevel.MEDIUM,
+    )
+    contract = IntentContract.from_create(
+        IntentContractCreate(
+            agent_id="agent-01",
+            session_id="session-live-g1",
+            goal="Data transmit",
+            allowed_tools=["external.http_post"],
+            allowed_data_classifications=[DataClassification.PUBLIC],
+        )
+    )
+    graph_ctx = PolicyGraphContext(
+        analysis_status=GraphAnalysisStatus.SUCCESS,
+        analysis_complete=True,
+        causal_depth=2,
+        ancestor_count=2,
+        ancestor_action_ids=["id-1", "id-2"],
+        ancestor_tool_sequence=["database.read", "file.write"],
+        ancestor_environments=["DEVELOPMENT", "DEVELOPMENT"],
+        ancestor_data_classifications=["CONFIDENTIAL", "PII"],
+    )
+    policy_input = build_cage_policy_input(
+        action, contract=contract, tool_registry=registry, graph_context=graph_ctx
+    )
+    res = live_opa_client.evaluate(policy_input)
+
+    assert res.status == OpaStatus.SUCCESS
+    rule_ids = [f.rule_id for f in res.findings]
+    assert "RULE_GRAPH_EXTERNAL_AFTER_SENSITIVE_ACCESS" in rule_ids
+    assert any(f.decision == PolicyDecision.DENY for f in res.findings)
+
+
+@pytest.mark.opa
+def test_live_rego_graph_sensitive_ancestry_secret_and_credential(
+    live_opa_client: OpaClient,
+) -> None:
+    """Requirement 5 & 7: Verify live OPA denies external sink for SECRET and CREDENTIAL ancestry."""
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="external.http_post",
+            description="External HTTP sink",
+            external_sink=True,
+        )
+    )
+
+    for sensitive_class in ["SECRET", "CREDENTIAL"]:
+        action = AgentAction(
+            action_id=uuid4(),
+            agent_id="agent-01",
+            session_id=f"session-live-sens-{sensitive_class.lower()}",
+            tool_name="external.http_post",
+            action_type=ActionType.TOOL_CALL,
+            target_environment=TargetEnvironment.DEVELOPMENT,
+            data_classifications=[DataClassification.PUBLIC],
+            input_trust_level=TrustLevel.MEDIUM,
+        )
+        contract = IntentContract.from_create(
+            IntentContractCreate(
+                agent_id="agent-01",
+                session_id=f"session-live-sens-{sensitive_class.lower()}",
+                goal="Data transfer",
+                allowed_tools=["external.http_post"],
+            )
+        )
+        graph_ctx = PolicyGraphContext(
+            analysis_status=GraphAnalysisStatus.SUCCESS,
+            analysis_complete=True,
+            causal_depth=1,
+            ancestor_count=1,
+            ancestor_action_ids=["sens-id-1"],
+            ancestor_tool_sequence=["vault.fetch"],
+            ancestor_environments=["DEVELOPMENT"],
+            ancestor_data_classifications=[sensitive_class],
+        )
+        policy_input = build_cage_policy_input(
+            action, contract=contract, tool_registry=registry, graph_context=graph_ctx
+        )
+        res = live_opa_client.evaluate(policy_input)
+
+        assert res.status == OpaStatus.SUCCESS
+        rule_ids = [f.rule_id for f in res.findings]
+        assert "RULE_GRAPH_EXTERNAL_AFTER_SENSITIVE_ACCESS" in rule_ids
+        assert any(f.decision == PolicyDecision.DENY for f in res.findings)
+
+
+@pytest.mark.opa
+def test_live_rego_graph_repeated_privilege_probing(live_opa_client: OpaClient) -> None:
+    """Requirement 7 & 8: Verify live OPA yields QUARANTINE on repeated probing threshold (3 attempts)."""
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="admin.exec_cmd",
+            description="Privileged admin execution",
+            known=True,
+            privileged=True,
+        )
+    )
+    action = AgentAction(
+        action_id=uuid4(),
+        agent_id="agent-01",
+        session_id="session-live-probing",
+        tool_name="admin.exec_cmd",
+        action_type=ActionType.TOOL_CALL,
+        target_environment=TargetEnvironment.DEVELOPMENT,
+        input_trust_level=TrustLevel.MEDIUM,
+    )
+    contract = IntentContract.from_create(
+        IntentContractCreate(
+            agent_id="agent-01",
+            session_id="session-live-probing",
+            goal="Maintenance",
+            allowed_tools=["admin.exec_cmd"],
+        )
+    )
+    graph_ctx = PolicyGraphContext(
+        analysis_status=GraphAnalysisStatus.SUCCESS,
+        analysis_complete=True,
+        causal_depth=2,
+        ancestor_count=2,
+        ancestor_action_ids=["probe-1", "probe-2"],
+        ancestor_tool_sequence=["probe.unknown1", "probe.unknown2"],
+        ancestor_environments=["DEVELOPMENT", "DEVELOPMENT"],
+        privileged_probe_count=2,  # 2 prior probes + 1 current probe = 3 -> threshold reached!
+    )
+    policy_input = build_cage_policy_input(
+        action, contract=contract, tool_registry=registry, graph_context=graph_ctx
+    )
+    res = live_opa_client.evaluate(policy_input)
+
+    assert res.status == OpaStatus.SUCCESS
+    rule_ids = [f.rule_id for f in res.findings]
+    assert "RULE_GRAPH_REPEATED_PRIVILEGE_PROBING" in rule_ids
+    quarantine_finding = next(
+        f for f in res.findings if f.rule_id == "RULE_GRAPH_REPEATED_PRIVILEGE_PROBING"
+    )
+    assert quarantine_finding.decision == PolicyDecision.QUARANTINE
+
+
+@pytest.mark.opa
+def test_live_rego_graph_environment_escalation(live_opa_client: OpaClient) -> None:
+    """Requirement 7 & 8: Verify live OPA yields REQUIRE_APPROVAL on environment escalation."""
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="admin.exec_cmd",
+            description="Privileged admin execution",
+            known=True,
+            privileged=True,
+        )
+    )
+    action = AgentAction(
+        action_id=uuid4(),
+        agent_id="agent-01",
+        session_id="session-live-env",
+        tool_name="admin.exec_cmd",
+        action_type=ActionType.TOOL_CALL,
+        target_environment=TargetEnvironment.PRODUCTION,
+        input_trust_level=TrustLevel.MEDIUM,
+    )
+    contract = IntentContract.from_create(
+        IntentContractCreate(
+            agent_id="agent-01",
+            session_id="session-live-env",
+            goal="Prod deployment",
+            allowed_tools=["admin.exec_cmd"],
+            allowed_environments=[TargetEnvironment.PRODUCTION],
+        )
+    )
+    graph_ctx = PolicyGraphContext(
+        analysis_status=GraphAnalysisStatus.SUCCESS,
+        analysis_complete=True,
+        causal_depth=2,
+        ancestor_count=2,
+        ancestor_action_ids=["id-dev-1", "id-dev-2"],
+        ancestor_tool_sequence=["web.search", "file.write"],
+        ancestor_environments=["DEVELOPMENT", "DEVELOPMENT"],
+        has_lower_environment_ancestor=True,
+        has_high_environment_ancestor=False,
+    )
+    policy_input = build_cage_policy_input(
+        action, contract=contract, tool_registry=registry, graph_context=graph_ctx
+    )
+    res = live_opa_client.evaluate(policy_input)
+
+    assert res.status == OpaStatus.SUCCESS
+    rule_ids = [f.rule_id for f in res.findings]
+    assert "RULE_GRAPH_ENVIRONMENT_ESCALATION" in rule_ids
+    escalation_finding = next(
+        f for f in res.findings if f.rule_id == "RULE_GRAPH_ENVIRONMENT_ESCALATION"
+    )
+    assert escalation_finding.decision == PolicyDecision.REQUIRE_APPROVAL
+
+
+@pytest.mark.opa
+def test_live_rego_graph_denied_ancestor_privileged_escalation(live_opa_client: OpaClient) -> None:
+    """Requirement 1 & 7: Verify live OPA yields REQUIRE_APPROVAL for privileged action after denial."""
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="admin.exec_cmd",
+            description="Privileged admin execution",
+            known=True,
+            privileged=True,
+        )
+    )
+    action = AgentAction(
+        action_id=uuid4(),
+        agent_id="agent-01",
+        session_id="session-live-denied-priv",
+        tool_name="admin.exec_cmd",
+        action_type=ActionType.TOOL_CALL,
+        target_environment=TargetEnvironment.DEVELOPMENT,
+        input_trust_level=TrustLevel.MEDIUM,
+    )
+    contract = IntentContract.from_create(
+        IntentContractCreate(
+            agent_id="agent-01",
+            session_id="session-live-denied-priv",
+            goal="Follow up execution",
+            allowed_tools=["admin.exec_cmd"],
+        )
+    )
+    graph_ctx = PolicyGraphContext(
+        analysis_status=GraphAnalysisStatus.SUCCESS,
+        analysis_complete=True,
+        causal_depth=1,
+        ancestor_count=1,
+        ancestor_action_ids=["denied-1"],
+        ancestor_tool_sequence=["forbidden.tool"],
+        ancestor_environments=["DEVELOPMENT"],
+        contains_denied_ancestor=True,
+    )
+    policy_input = build_cage_policy_input(
+        action, contract=contract, tool_registry=registry, graph_context=graph_ctx
+    )
+    res = live_opa_client.evaluate(policy_input)
+
+    assert res.status == OpaStatus.SUCCESS
+    rule_ids = [f.rule_id for f in res.findings]
+    assert "RULE_GRAPH_DENIED_ANCESTOR_ESCALATION" in rule_ids
+    finding = next(f for f in res.findings if f.rule_id == "RULE_GRAPH_DENIED_ANCESTOR_ESCALATION")
+    assert finding.decision == PolicyDecision.REQUIRE_APPROVAL
+
+
+@pytest.mark.opa
+def test_live_rego_graph_denied_ancestor_benign_action_allowed(live_opa_client: OpaClient) -> None:
+    """Requirement 1 & 3: Benign action after denial must NOT trigger RULE_GRAPH_DENIED_ANCESTOR_ESCALATION in live OPA."""
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="web.search",
+            description="Search tool",
+            known=True,
+            privileged=False,
+            destructive=False,
+        )
+    )
+    action = AgentAction(
+        action_id=uuid4(),
+        agent_id="agent-01",
+        session_id="session-live-denied-benign",
+        tool_name="web.search",
+        action_type=ActionType.TOOL_CALL,
+        target_environment=TargetEnvironment.DEVELOPMENT,
+        data_classifications=[DataClassification.PUBLIC],
+        input_trust_level=TrustLevel.MEDIUM,
+    )
+    contract = IntentContract.from_create(
+        IntentContractCreate(
+            agent_id="agent-01",
+            session_id="session-live-denied-benign",
+            goal="Research following denial",
+            allowed_tools=["web.search"],
+        )
+    )
+    graph_ctx = PolicyGraphContext(
+        analysis_status=GraphAnalysisStatus.SUCCESS,
+        analysis_complete=True,
+        causal_depth=1,
+        ancestor_count=1,
+        ancestor_action_ids=["denied-1"],
+        ancestor_tool_sequence=["forbidden.tool"],
+        ancestor_environments=["DEVELOPMENT"],
+        contains_denied_ancestor=True,
+    )
+    policy_input = build_cage_policy_input(
+        action, contract=contract, tool_registry=registry, graph_context=graph_ctx
+    )
+    res = live_opa_client.evaluate(policy_input)
+
+    assert res.status == OpaStatus.SUCCESS
+    rule_ids = [f.rule_id for f in res.findings]
+    # CRITICAL: Benign action does NOT trigger denied-ancestor escalation
+    assert "RULE_GRAPH_DENIED_ANCESTOR_ESCALATION" not in rule_ids
+    assert "RULE_INTENT_ALLOW" in rule_ids
+    assert all(f.decision == PolicyDecision.ALLOW for f in res.findings)
+
+
+@pytest.mark.opa
+def test_live_rego_graph_depth_limit_failure(live_opa_client: OpaClient) -> None:
+    """Requirement 7 & 8: Verify live OPA evaluates DEPTH_LIMIT_EXCEEDED to DENY fail-closed."""
+    action = AgentAction(
+        action_id=uuid4(),
+        agent_id="agent-01",
+        session_id="session-live-limit",
+        tool_name="web.search",
+        action_type=ActionType.TOOL_CALL,
+        target_environment=TargetEnvironment.DEVELOPMENT,
+        input_trust_level=TrustLevel.MEDIUM,
+    )
+    contract = IntentContract.from_create(
+        IntentContractCreate(
+            agent_id="agent-01",
+            session_id="session-live-limit",
+            goal="Traversal test",
+            allowed_tools=["web.search"],
+        )
+    )
+    graph_ctx = PolicyGraphContext(
+        analysis_status=GraphAnalysisStatus.DEPTH_LIMIT_EXCEEDED,
+        analysis_complete=False,
+        causal_depth=26,
+        ancestor_count=26,
+    )
+    policy_input = build_cage_policy_input(action, contract=contract, graph_context=graph_ctx)
+    res = live_opa_client.evaluate(policy_input)
+
+    assert res.status == OpaStatus.SUCCESS
+    rule_ids = [f.rule_id for f in res.findings]
+    assert "RULE_GRAPH_DEPTH_LIMIT_EXCEEDED" in rule_ids
+    depth_finding = next(f for f in res.findings if f.rule_id == "RULE_GRAPH_DEPTH_LIMIT_EXCEEDED")
+    assert depth_finding.decision == PolicyDecision.DENY
+
+
+@pytest.mark.opa
+def test_live_rego_graph_python_parity(live_opa_client: OpaClient) -> None:
+    """Requirement 7: Verify live OPA and Python evaluator produce identical decisions for graph policies."""
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="admin.exec_cmd",
+            description="Privileged admin execution",
+            known=True,
+            privileged=True,
+        )
+    )
+    action = AgentAction(
+        action_id=uuid4(),
+        agent_id="agent-01",
+        session_id="session-live-parity",
+        tool_name="admin.exec_cmd",
+        action_type=ActionType.TOOL_CALL,
+        target_environment=TargetEnvironment.DEVELOPMENT,
+        input_trust_level=TrustLevel.MEDIUM,
+    )
+    contract = IntentContract.from_create(
+        IntentContractCreate(
+            agent_id="agent-01",
+            session_id="session-live-parity",
+            goal="Maintenance",
+            allowed_tools=["admin.exec_cmd"],
+        )
+    )
+    graph_ctx = PolicyGraphContext(
+        analysis_status=GraphAnalysisStatus.SUCCESS,
+        analysis_complete=True,
+        causal_depth=2,
+        ancestor_count=2,
+        ancestor_action_ids=["id-1", "id-2"],
+        ancestor_tool_sequence=["t1", "t2"],
+        ancestor_environments=["DEVELOPMENT", "DEVELOPMENT"],
+        privileged_probe_count=2,
+    )
+    policy_input = build_cage_policy_input(
+        action, contract=contract, tool_registry=registry, graph_context=graph_ctx
+    )
+
+    # 1. Live OPA evaluation
+    opa_res = live_opa_client.evaluate(policy_input)
+    assert opa_res.status == OpaStatus.SUCCESS
+    opa_rules = {f.rule_id for f in opa_res.findings}
+
+    # 2. Python evaluation
+    python_evaluator = DeterministicPolicyEvaluator(tool_registry=registry)
+    python_decision = python_evaluator.evaluate(
+        action=action,
+        contract=contract,
+        require_intent=True,
+        graph_context=graph_ctx,
+    )
+
+    # 3. Assert parity
+    assert "RULE_GRAPH_REPEATED_PRIVILEGE_PROBING" in opa_rules
+    assert "RULE_GRAPH_REPEATED_PRIVILEGE_PROBING" in python_decision.matched_rules
+    assert python_decision.decision == PolicyDecision.QUARANTINE
+    assert any(f.decision == PolicyDecision.QUARANTINE for f in opa_res.findings)

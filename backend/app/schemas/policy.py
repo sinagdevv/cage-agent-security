@@ -2,11 +2,17 @@
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.schemas.enums import OpaStatus, PolicyBackend, PolicyDecision, PolicyParityStatus
+from app.schemas.enums import (
+    GraphAnalysisStatus,
+    OpaStatus,
+    PolicyBackend,
+    PolicyDecision,
+    PolicyParityStatus,
+)
 
 # Global schema identifier for policy input
-POLICY_INPUT_SCHEMA_VERSION = "cage-policy-input-v1"
-POLICY_VERSION = "phase3-v1"
+POLICY_INPUT_SCHEMA_VERSION = "cage-policy-input-v2"
+POLICY_VERSION = "phase4-v1"
 
 
 class PolicyActionContext(BaseModel):
@@ -81,6 +87,34 @@ class PolicyRuntimeContext(BaseModel):
     delegation_depth: int = 0
 
 
+class PolicyGraphContext(BaseModel):
+    """Authoritative, server-derived causal graph facts for runtime policy evaluation.
+
+    Client runtimes cannot supply or alter these fields.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    analysis_status: GraphAnalysisStatus = GraphAnalysisStatus.SUCCESS
+    analysis_complete: bool = True
+    causal_depth: int = Field(default=0, ge=0)
+    ancestor_count: int = Field(default=0, ge=0)
+    ancestor_action_ids: list[str] = Field(default_factory=list)
+    ancestor_tool_sequence: list[str] = Field(default_factory=list)
+    ancestor_environments: list[str] = Field(default_factory=list)
+    ancestor_data_classifications: list[str] = Field(default_factory=list)
+
+    contains_denied_ancestor: bool = False
+    contains_approval_ancestor: bool = False
+    contains_external_sink_ancestor: bool = False
+    contains_privileged_ancestor: bool = False
+    contains_destructive_ancestor: bool = False
+
+    privileged_probe_count: int = Field(default=0, ge=0)
+    has_lower_environment_ancestor: bool = False
+    has_high_environment_ancestor: bool = False
+
+
 class CagePolicyInput(BaseModel):
     """Canonical, server-derived policy input document sent to policy evaluators.
 
@@ -100,6 +134,7 @@ class CagePolicyInput(BaseModel):
     tool: PolicyToolContext
     data: PolicyDataContext
     context: PolicyRuntimeContext
+    graph: PolicyGraphContext = Field(default_factory=PolicyGraphContext)
 
 
 class OpaFinding(BaseModel):

@@ -9,6 +9,7 @@ from app.schemas.policy import (
     PolicyActionContext,
     PolicyAgentContext,
     PolicyDataContext,
+    PolicyGraphContext,
     PolicyIntentContext,
     PolicyRuntimeContext,
     PolicyToolContext,
@@ -21,6 +22,7 @@ def build_cage_policy_input(
     tool_registry: ToolRegistry | None = None,
     require_intent: bool = True,
     intent_mismatch: bool = False,
+    graph_context: PolicyGraphContext | None = None,
 ) -> CagePolicyInput:
     """Build the single authoritative CagePolicyInput document for an evaluated action.
 
@@ -95,6 +97,8 @@ def build_cage_policy_input(
         delegation_depth=len(action.delegation_chain),
     )
 
+    graph_ctx = graph_context or PolicyGraphContext()
+
     return CagePolicyInput(
         action=action_ctx,
         agent=agent_ctx,
@@ -102,4 +106,5 @@ def build_cage_policy_input(
         tool=tool_ctx,
         data=data_ctx,
         context=runtime_ctx,
+        graph=graph_ctx,
     )

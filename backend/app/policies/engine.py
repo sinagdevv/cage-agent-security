@@ -66,6 +66,7 @@ class PolicyEngine:
             contract=contract,
             require_intent=policy_input.context.require_intent,
             intent_mismatch=policy_input.context.intent_mismatch,
+            graph_context=policy_input.graph,
         )
         decision.policy_backend = PolicyBackend.PYTHON
         decision.policy_version = self.policy_version
@@ -131,6 +132,7 @@ class PolicyEngine:
             contract=contract,
             require_intent=policy_input.context.require_intent,
             intent_mismatch=policy_input.context.intent_mismatch,
+            graph_context=policy_input.graph,
         )
 
         # 2. Shadow OPA evaluation
