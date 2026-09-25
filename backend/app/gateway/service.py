@@ -12,10 +12,12 @@ from app.graph.causal_graph import (
     default_session_graph_manager,
 )
 from app.intent.service import IntentService, default_intent_service
-from app.policies.rules import DeterministicPolicyEvaluator, default_policy_evaluator
+from app.policies.engine import PolicyEngine, default_policy_engine
+from app.policies.policy_input import build_cage_policy_input
+from app.policies.rules import DeterministicPolicyEvaluator
 from app.schemas.action import AgentAction, AgentActionProposal
 from app.schemas.decision import SecurityDecision
-from app.schemas.enums import PolicyDecision, ToolExecutionStatus
+from app.schemas.enums import PolicyBackend, PolicyDecision, ToolExecutionStatus
 
 logger = logging.getLogger("cage.gateway")
 
@@ -31,17 +33,29 @@ class AgentGateway:
         self,
         graph_manager: SessionGraphManager | None = None,
         policy_evaluator: DeterministicPolicyEvaluator | None = None,
+        policy_engine: PolicyEngine | None = None,
         intent_service: IntentService | None = None,
         tool_registry: ToolRegistry | None = None,
         tool_executor: ToolExecutor | None = None,
         require_intent: bool = True,
     ) -> None:
         self.graph_manager = graph_manager or default_session_graph_manager
-        self.policy_evaluator = policy_evaluator or default_policy_evaluator
         self.intent_service = intent_service or default_intent_service
         self.tool_registry = tool_registry or default_tool_registry
         self.tool_executor = tool_executor or default_tool_executor
         self.require_intent = require_intent
+
+        if policy_engine is not None:
+            self.policy_engine = policy_engine
+            self.policy_evaluator = policy_engine.python_evaluator
+        elif policy_evaluator is not None:
+            self.policy_evaluator = policy_evaluator
+            self.policy_engine = PolicyEngine(
+                python_evaluator=policy_evaluator, backend=PolicyBackend.PYTHON
+            )
+        else:
+            self.policy_engine = default_policy_engine
+            self.policy_evaluator = default_policy_engine.python_evaluator
 
     def evaluate_proposal(
         self, proposal: AgentActionProposal
@@ -141,15 +155,23 @@ class AgentGateway:
         for prev_id in proposal.previous_action_ids:
             graph.add_relationship(str(prev_id), action_key, relation="precedes")
 
-        # 6. Policy evaluation (Unified Intent + Runtime Policies)
-        decision = self.policy_evaluator.evaluate(
+        # 6. Build single canonical CagePolicyInput document
+        policy_input = build_cage_policy_input(
             action=action,
             contract=contract,
+            tool_registry=self.tool_registry,
             require_intent=self.require_intent,
             intent_mismatch=intent_mismatch,
         )
 
-        # 7. Atomic Tool Execution Budget Reservation
+        # 7. Policy evaluation (Unified Python / OPA via PolicyEngine)
+        decision, parity_result = self.policy_engine.evaluate(
+            policy_input=policy_input,
+            action=action,
+            contract=contract,
+        )
+
+        # 8. Atomic Tool Execution Budget Reservation
         # Only ALLOWed actions consume from the execution budget.
         if decision.decision == PolicyDecision.ALLOW and contract is not None:
             reserved = self.intent_service.reserve_tool_execution(contract.intent_id)
@@ -164,9 +186,12 @@ class AgentGateway:
                     matched_rules=decision.matched_rules + ["RULE_TOOL_BUDGET_EXCEEDED"],
                     risk_score=0.85,
                     requires_human_approval=False,
+                    policy_backend=decision.policy_backend,
+                    policy_version=decision.policy_version,
+                    policy_input_schema_version=decision.policy_input_schema_version,
                 )
 
-        # 8. Map verdict to execution status
+        # 9. Map verdict to execution status
         if decision.decision == PolicyDecision.ALLOW:
             execution_status = ToolExecutionStatus.AUTHORIZED
         elif decision.decision == PolicyDecision.REQUIRE_APPROVAL:
@@ -174,7 +199,7 @@ class AgentGateway:
         else:
             execution_status = ToolExecutionStatus.DENIED
 
-        # 9. Update action state in graph and internal storage
+        # 10. Update action state in graph and internal storage
         graph.update_action_state(
             action_id=action_key,
             execution_status=execution_status,
@@ -185,12 +210,14 @@ class AgentGateway:
         )
 
         logger.info(
-            "Action evaluated: action_id=%s tool=%s decision=%s rules=%s intent=%s",
+            "Action evaluated: action_id=%s tool=%s decision=%s rules=%s intent=%s backend=%s version=%s",
             action.action_id,
             action.tool_name,
             decision.decision.value,
             decision.matched_rules,
             decision.intent_contract_id,
+            decision.policy_backend.value if decision.policy_backend else "UNKNOWN",
+            decision.policy_version or "UNKNOWN",
         )
 
         return action, decision

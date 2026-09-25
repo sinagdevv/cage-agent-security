@@ -26,6 +26,10 @@ try:
         )
         redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
         opa_url: str = os.getenv("OPA_URL", "http://localhost:8181")
+        opa_timeout_seconds: float = float(os.getenv("OPA_TIMEOUT_SECONDS", "2.0"))
+        policy_backend: str = os.getenv("CAGE_POLICY_BACKEND", "SHADOW")
+        policy_version: str = os.getenv("CAGE_POLICY_VERSION", "phase3-v1")
+        policy_input_schema_version: str = "cage-policy-input-v1"
 
         secret_key: str = os.getenv("CAGE_SECRET_KEY", "dev-secret-key-change-in-production")
         api_key: str | None = os.getenv("CAGE_API_KEY", "cage_dev_test_api_key")
@@ -48,6 +52,10 @@ except ImportError:
         )
         redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
         opa_url: str = os.getenv("OPA_URL", "http://localhost:8181")
+        opa_timeout_seconds: float = float(os.getenv("OPA_TIMEOUT_SECONDS", "2.0"))
+        policy_backend: str = os.getenv("CAGE_POLICY_BACKEND", "SHADOW")
+        policy_version: str = os.getenv("CAGE_POLICY_VERSION", "phase3-v1")
+        policy_input_schema_version: str = "cage-policy-input-v1"
 
         secret_key: str = os.getenv("CAGE_SECRET_KEY", "dev-secret-key-change-in-production")
         api_key: str | None = os.getenv("CAGE_API_KEY", "cage_dev_test_api_key")

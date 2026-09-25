@@ -93,3 +93,30 @@ class IntentStatus(StrEnum):
     EXPIRED = "EXPIRED"
     REVOKED = "REVOKED"
     COMPLETED = "COMPLETED"
+
+
+class PolicyBackend(StrEnum):
+    """Operational mode for CAGE deterministic policy enforcement."""
+
+    PYTHON = "PYTHON"
+    SHADOW = "SHADOW"
+    OPA = "OPA"
+
+
+class PolicyParityStatus(StrEnum):
+    """Classification of parity comparison between Python and OPA engines."""
+
+    MATCH = "MATCH"
+    DIVERGENCE = "DIVERGENCE"
+    OPA_ERROR = "OPA_ERROR"
+    NOT_EVALUATED = "NOT_EVALUATED"
+
+
+class OpaStatus(StrEnum):
+    """Outcome of OPA HTTP client evaluation attempt."""
+
+    SUCCESS = "SUCCESS"
+    TIMEOUT = "TIMEOUT"
+    UNAVAILABLE = "UNAVAILABLE"
+    INVALID_RESPONSE = "INVALID_RESPONSE"
+    EVALUATION_ERROR = "EVALUATION_ERROR"

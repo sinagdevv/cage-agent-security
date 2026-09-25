@@ -478,4 +478,3 @@ def test_security_decision_uses_authoritative_intent_contract_id(
     )
     _, decision_no_id = strict_gateway.evaluate_proposal(prop_no_id)
     assert decision_no_id.intent_contract_id == contract.intent_id
-

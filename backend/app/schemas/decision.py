@@ -5,7 +5,7 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
 
-from app.schemas.enums import PolicyDecision
+from app.schemas.enums import PolicyBackend, PolicyDecision
 
 
 class SecurityDecision(BaseModel):
@@ -31,6 +31,15 @@ class SecurityDecision(BaseModel):
     )
     requires_human_approval: bool = Field(
         default=False, description="Whether human approval is required"
+    )
+    policy_backend: PolicyBackend | None = Field(
+        default=None, description="Policy engine backend that produced this decision"
+    )
+    policy_version: str | None = Field(
+        default=None, description="Version of declarative/rule policy applied"
+    )
+    policy_input_schema_version: str | None = Field(
+        default=None, description="Version of canonical policy input schema"
     )
     timestamp: datetime = Field(
         default_factory=lambda: datetime.now(UTC), description="Decision timestamp"

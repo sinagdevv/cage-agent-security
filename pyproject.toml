@@ -61,6 +61,10 @@ python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "-v --strict-markers"
 asyncio_mode = "auto"
+markers = [
+    "opa: tests requiring live OPA container",
+    "integration: end-to-end integration tests",
+]
 
 [tool.ruff]
 line-length = 100

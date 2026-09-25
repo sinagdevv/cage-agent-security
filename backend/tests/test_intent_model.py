@@ -97,4 +97,3 @@ def test_client_cannot_modify_authoritative_tool_calls_count() -> None:
     )
     with pytest.raises(ValidationError):
         contract.tool_calls_count = 10  # type: ignore[misc]
-
