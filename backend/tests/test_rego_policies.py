@@ -19,11 +19,13 @@ from app.schemas.enums import (
     GraphAnalysisStatus,
     OpaStatus,
     PolicyDecision,
+    ProvenanceAnalysisStatus,
+    ProvenanceTrust,
     TargetEnvironment,
     TrustLevel,
 )
 from app.schemas.intent import IntentContract, IntentContractCreate
-from app.schemas.policy import PolicyGraphContext
+from app.schemas.policy import PolicyGraphContext, PolicyProvenanceContext
 
 
 @pytest.fixture
@@ -618,3 +620,358 @@ def test_live_rego_graph_python_parity(live_opa_client: OpaClient) -> None:
     assert "RULE_GRAPH_REPEATED_PRIVILEGE_PROBING" in python_decision.matched_rules
     assert python_decision.decision == PolicyDecision.QUARANTINE
     assert any(f.decision == PolicyDecision.QUARANTINE for f in opa_res.findings)
+
+
+@pytest.mark.opa
+def test_live_rego_provenance_sensitive_to_external(live_opa_client: OpaClient) -> None:
+    """Verify live OPA evaluates RULE_PROVENANCE_SENSITIVE_TO_EXTERNAL as DENY."""
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="external.http_post",
+            description="External HTTP sink",
+            external_sink=True,
+        )
+    )
+    action = AgentAction(
+        action_id=uuid4(),
+        agent_id="agent-01",
+        session_id="session-live-prov-sens",
+        tool_name="external.http_post",
+        action_type=ActionType.TOOL_CALL,
+        target_environment=TargetEnvironment.DEVELOPMENT,
+        data_classifications=[DataClassification.PUBLIC],
+        input_trust_level=TrustLevel.MEDIUM,
+    )
+    contract = IntentContract.from_create(
+        IntentContractCreate(
+            agent_id="agent-01",
+            session_id="session-live-prov-sens",
+            goal="Data export",
+            allowed_tools=["external.http_post"],
+        )
+    )
+    prov_ctx = PolicyProvenanceContext(
+        contains_sensitive_input=True,
+        input_classifications=["CONFIDENTIAL", "PII"],
+    )
+    policy_input = build_cage_policy_input(
+        action, contract=contract, tool_registry=registry, provenance_context=prov_ctx
+    )
+
+    res = live_opa_client.evaluate(policy_input)
+    assert res.status == OpaStatus.SUCCESS
+    rule_ids = [f.rule_id for f in res.findings]
+    assert "RULE_PROVENANCE_SENSITIVE_TO_EXTERNAL" in rule_ids
+    assert any(
+        f.decision == PolicyDecision.DENY and f.rule_id == "RULE_PROVENANCE_SENSITIVE_TO_EXTERNAL"
+        for f in res.findings
+    )
+
+
+@pytest.mark.opa
+def test_live_rego_provenance_untracked_egress(live_opa_client: OpaClient) -> None:
+    """Verify live OPA evaluates RULE_PROVENANCE_UNTRACKED_EGRESS as DENY."""
+    from app.schemas.enums import PayloadBindingMode
+
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="external.http_post",
+            description="External HTTP sink",
+            external_sink=True,
+            requires_tracked_inputs=True,
+            payload_binding_mode=PayloadBindingMode.ARTIFACT_REQUIRED,
+        )
+    )
+    action = AgentAction(
+        action_id=uuid4(),
+        agent_id="agent-01",
+        session_id="session-live-prov-untracked",
+        tool_name="external.http_post",
+        action_type=ActionType.TOOL_CALL,
+        target_environment=TargetEnvironment.DEVELOPMENT,
+        data_classifications=[DataClassification.PUBLIC],
+        input_trust_level=TrustLevel.MEDIUM,
+    )
+    contract = IntentContract.from_create(
+        IntentContractCreate(
+            agent_id="agent-01",
+            session_id="session-live-prov-untracked",
+            goal="Data export",
+            allowed_tools=["external.http_post"],
+        )
+    )
+    prov_ctx = PolicyProvenanceContext(
+        payload_binding_required=True,
+        payload_binding_satisfied=False,
+    )
+    policy_input = build_cage_policy_input(
+        action, contract=contract, tool_registry=registry, provenance_context=prov_ctx
+    )
+
+    res = live_opa_client.evaluate(policy_input)
+    assert res.status == OpaStatus.SUCCESS
+    rule_ids = [f.rule_id for f in res.findings]
+    assert "RULE_PROVENANCE_UNTRACKED_EGRESS" in rule_ids
+    assert any(
+        f.decision == PolicyDecision.DENY and f.rule_id == "RULE_PROVENANCE_UNTRACKED_EGRESS"
+        for f in res.findings
+    )
+
+
+@pytest.mark.opa
+def test_live_rego_provenance_untrusted_to_privileged(live_opa_client: OpaClient) -> None:
+    """Verify live OPA evaluates RULE_PROVENANCE_UNTRUSTED_TO_PRIVILEGED as REQUIRE_APPROVAL."""
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="system.delete_resource",
+            description="System delete tool",
+            privileged=True,
+            destructive=True,
+        )
+    )
+    action = AgentAction(
+        action_id=uuid4(),
+        agent_id="agent-01",
+        session_id="session-live-prov-untrusted",
+        tool_name="system.delete_resource",
+        action_type=ActionType.TOOL_CALL,
+        target_environment=TargetEnvironment.DEVELOPMENT,
+        data_classifications=[DataClassification.PUBLIC],
+        input_trust_level=TrustLevel.EXTERNAL_UNTRUSTED,
+    )
+    contract = IntentContract.from_create(
+        IntentContractCreate(
+            agent_id="agent-01",
+            session_id="session-live-prov-untrusted",
+            goal="Admin cleanup",
+            allowed_tools=["system.delete_resource"],
+        )
+    )
+    prov_ctx = PolicyProvenanceContext(
+        contains_untrusted_input=True,
+        input_direct_trust_levels=["EXTERNAL_UNTRUSTED"],
+    )
+    policy_input = build_cage_policy_input(
+        action, contract=contract, tool_registry=registry, provenance_context=prov_ctx
+    )
+
+    res = live_opa_client.evaluate(policy_input)
+    assert res.status == OpaStatus.SUCCESS
+    rule_ids = [f.rule_id for f in res.findings]
+    assert "RULE_PROVENANCE_UNTRUSTED_TO_PRIVILEGED" in rule_ids
+    assert any(
+        f.decision == PolicyDecision.REQUIRE_APPROVAL
+        and f.rule_id == "RULE_PROVENANCE_UNTRUSTED_TO_PRIVILEGED"
+        for f in res.findings
+    )
+
+
+@pytest.mark.opa
+def test_live_rego_provenance_python_parity(live_opa_client: OpaClient) -> None:
+    """Verify Python and live OPA parity across provenance rules."""
+    from app.schemas.enums import PayloadBindingMode
+
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="external.http_post",
+            description="External HTTP sink",
+            external_sink=True,
+            requires_tracked_inputs=True,
+            payload_binding_mode=PayloadBindingMode.ARTIFACT_REQUIRED,
+        )
+    )
+    action = AgentAction(
+        action_id=uuid4(),
+        agent_id="agent-01",
+        session_id="session-live-prov-parity",
+        tool_name="external.http_post",
+        action_type=ActionType.TOOL_CALL,
+        target_environment=TargetEnvironment.DEVELOPMENT,
+        data_classifications=[DataClassification.PUBLIC],
+        input_trust_level=TrustLevel.MEDIUM,
+    )
+    contract = IntentContract.from_create(
+        IntentContractCreate(
+            agent_id="agent-01",
+            session_id="session-live-prov-parity",
+            goal="Export",
+            allowed_tools=["external.http_post"],
+        )
+    )
+    prov_ctx = PolicyProvenanceContext(
+        contains_credential_input=True,
+        input_classifications=["CREDENTIAL"],
+        payload_binding_required=True,
+        payload_binding_satisfied=True,
+    )
+    policy_input = build_cage_policy_input(
+        action, contract=contract, tool_registry=registry, provenance_context=prov_ctx
+    )
+
+    # 1. Live OPA evaluation
+    opa_res = live_opa_client.evaluate(policy_input)
+    assert opa_res.status == OpaStatus.SUCCESS
+    opa_rules = {f.rule_id for f in opa_res.findings}
+
+    # 2. Python evaluation
+    python_evaluator = DeterministicPolicyEvaluator(tool_registry=registry)
+    python_decision = python_evaluator.evaluate(
+        action=action,
+        contract=contract,
+        require_intent=True,
+        provenance_context=prov_ctx,
+    )
+
+    # 3. Assert parity
+    assert "RULE_PROVENANCE_CREDENTIAL_TO_EXTERNAL" in opa_rules
+    assert "RULE_PROVENANCE_CREDENTIAL_TO_EXTERNAL" in python_decision.matched_rules
+    assert python_decision.decision == PolicyDecision.DENY
+    assert any(
+        f.decision == PolicyDecision.DENY and f.rule_id == "RULE_PROVENANCE_CREDENTIAL_TO_EXTERNAL"
+        for f in opa_res.findings
+    )
+
+
+@pytest.mark.opa
+def test_live_rego_provenance_credential_to_external(live_opa_client: OpaClient) -> None:
+    """Verify live OPA evaluates RULE_PROVENANCE_CREDENTIAL_TO_EXTERNAL as DENY and partitions disjointly."""
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="external.http_post",
+            description="External HTTP sink",
+            external_sink=True,
+        )
+    )
+    action = AgentAction(
+        action_id=uuid4(),
+        agent_id="agent-01",
+        session_id="session-live-prov-cred",
+        tool_name="external.http_post",
+        action_type=ActionType.TOOL_CALL,
+        target_environment=TargetEnvironment.DEVELOPMENT,
+        data_classifications=[DataClassification.PUBLIC],
+        input_trust_level=TrustLevel.MEDIUM,
+    )
+    contract = IntentContract.from_create(
+        IntentContractCreate(
+            agent_id="agent-01",
+            session_id="session-live-prov-cred",
+            goal="Data export",
+            allowed_tools=["external.http_post"],
+        )
+    )
+    # CREDENTIAL input alone: contains_credential_input is True, contains_sensitive_input is False
+    prov_ctx = PolicyProvenanceContext(
+        contains_credential_input=True,
+        contains_sensitive_input=False,
+        input_classifications=["CREDENTIAL", "SECRET"],
+    )
+    policy_input = build_cage_policy_input(
+        action, contract=contract, tool_registry=registry, provenance_context=prov_ctx
+    )
+
+    res = live_opa_client.evaluate(policy_input)
+    assert res.status == OpaStatus.SUCCESS
+    rule_ids = [f.rule_id for f in res.findings]
+    assert "RULE_PROVENANCE_CREDENTIAL_TO_EXTERNAL" in rule_ids
+    # Crucial partition check: GENERAL_SENSITIVE rule is NOT emitted for purely CREDENTIAL/SECRET input
+    assert "RULE_PROVENANCE_SENSITIVE_TO_EXTERNAL" not in rule_ids
+    assert any(
+        f.decision == PolicyDecision.DENY and f.rule_id == "RULE_PROVENANCE_CREDENTIAL_TO_EXTERNAL"
+        for f in res.findings
+    )
+
+
+@pytest.mark.opa
+def test_live_rego_provenance_missing_artifact(live_opa_client: OpaClient) -> None:
+    """Verify live OPA evaluates RULE_PROVENANCE_MISSING_ARTIFACT as DENY fail-closed on analysis failure."""
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="file.write",
+            description="Write file",
+        )
+    )
+    action = AgentAction(
+        action_id=uuid4(),
+        agent_id="agent-01",
+        session_id="session-live-prov-missing",
+        tool_name="file.write",
+        action_type=ActionType.TOOL_CALL,
+        target_environment=TargetEnvironment.DEVELOPMENT,
+        data_classifications=[DataClassification.PUBLIC],
+        input_trust_level=TrustLevel.MEDIUM,
+    )
+    contract = IntentContract.from_create(
+        IntentContractCreate(
+            agent_id="agent-01",
+            session_id="session-live-prov-missing",
+            goal="File output",
+            allowed_tools=["file.write"],
+        )
+    )
+    prov_ctx = PolicyProvenanceContext(
+        analysis_status=ProvenanceAnalysisStatus.MISSING_ARTIFACT,
+        analysis_complete=False,
+    )
+    policy_input = build_cage_policy_input(
+        action, contract=contract, tool_registry=registry, provenance_context=prov_ctx
+    )
+
+    res = live_opa_client.evaluate(policy_input)
+    assert res.status == OpaStatus.SUCCESS
+    rule_ids = [f.rule_id for f in res.findings]
+    assert "RULE_PROVENANCE_MISSING_ARTIFACT" in rule_ids
+    finding = next(f for f in res.findings if f.rule_id == "RULE_PROVENANCE_MISSING_ARTIFACT")
+    assert finding.decision == PolicyDecision.DENY
+
+
+@pytest.mark.opa
+def test_live_rego_provenance_unknown_to_privileged(live_opa_client: OpaClient) -> None:
+    """Verify live OPA evaluates RULE_PROVENANCE_UNKNOWN_TO_PRIVILEGED as REQUIRE_APPROVAL."""
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="system.reboot",
+            description="Privileged reboot tool",
+            privileged=True,
+        )
+    )
+    action = AgentAction(
+        action_id=uuid4(),
+        agent_id="agent-01",
+        session_id="session-live-prov-unknown",
+        tool_name="system.reboot",
+        action_type=ActionType.TOOL_CALL,
+        target_environment=TargetEnvironment.DEVELOPMENT,
+        data_classifications=[DataClassification.PUBLIC],
+        input_trust_level=ProvenanceTrust.UNKNOWN,
+    )
+    contract = IntentContract.from_create(
+        IntentContractCreate(
+            agent_id="agent-01",
+            session_id="session-live-prov-unknown",
+            goal="System reboot",
+            allowed_tools=["system.reboot"],
+        )
+    )
+    prov_ctx = PolicyProvenanceContext(
+        analysis_complete=True,
+        contains_unknown_input=True,
+        input_direct_trust_levels=["UNKNOWN"],
+    )
+    policy_input = build_cage_policy_input(
+        action, contract=contract, tool_registry=registry, provenance_context=prov_ctx
+    )
+
+    res = live_opa_client.evaluate(policy_input)
+    assert res.status == OpaStatus.SUCCESS
+    rule_ids = [f.rule_id for f in res.findings]
+    assert "RULE_PROVENANCE_UNKNOWN_TO_PRIVILEGED" in rule_ids
+    finding = next(f for f in res.findings if f.rule_id == "RULE_PROVENANCE_UNKNOWN_TO_PRIVILEGED")
+    assert finding.decision == PolicyDecision.REQUIRE_APPROVAL

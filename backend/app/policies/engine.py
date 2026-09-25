@@ -67,6 +67,8 @@ class PolicyEngine:
             require_intent=policy_input.context.require_intent,
             intent_mismatch=policy_input.context.intent_mismatch,
             graph_context=policy_input.graph,
+            provenance_context=policy_input.provenance,
+            trajectory_context=policy_input.trajectory,
         )
         decision.policy_backend = PolicyBackend.PYTHON
         decision.policy_version = self.policy_version
@@ -133,6 +135,8 @@ class PolicyEngine:
             require_intent=policy_input.context.require_intent,
             intent_mismatch=policy_input.context.intent_mismatch,
             graph_context=policy_input.graph,
+            provenance_context=policy_input.provenance,
+            trajectory_context=policy_input.trajectory,
         )
 
         # 2. Shadow OPA evaluation

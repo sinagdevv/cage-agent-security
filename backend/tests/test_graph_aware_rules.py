@@ -379,12 +379,12 @@ def test_rule_graph_repeated_privilege_probing_quarantined(clean_gateway):
     )
     act_1, dec_1 = gateway.evaluate_proposal(prop_1)
 
-    # Probe 2: admin.exec_cmd (privileged)
+    # Probe 2: unknown.probe_2 (unauthorized probe)
     prop_2 = AgentActionProposal(
         agent_id=agent_id,
         agent_instance_id="inst-1",
         session_id=session_id,
-        tool_name="admin.exec_cmd",
+        tool_name="unknown.probe_2",
         goal="Probe 2",
         current_task="p2",
         parent_action_id=act_1.action_id,

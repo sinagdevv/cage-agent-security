@@ -64,6 +64,7 @@ asyncio_mode = "auto"
 markers = [
     "opa: tests requiring live OPA container",
     "integration: end-to-end integration tests",
+    "benchmark: performance and scaling benchmark tests",
 ]
 
 [tool.ruff]

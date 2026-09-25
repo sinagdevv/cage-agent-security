@@ -78,6 +78,12 @@ class AgentActionProposal(BaseModel):
     expected_effect: str | None = Field(
         default=None, description="Agent's declared intended effect"
     )
+    input_artifact_ids: list[UUID] = Field(
+        default_factory=list, description="Untrusted client references to input artifacts"
+    )
+    client_correlation_id: str | None = Field(
+        default=None, description="Optional client-provided correlation ID (no auth meaning)"
+    )
 
 
 class AgentAction(BaseModel):
@@ -94,6 +100,9 @@ class AgentAction(BaseModel):
         default_factory=uuid4, description="Server-generated unique action UUID"
     )
     client_action_id: str | None = Field(default=None, description="Correlated client proposal ID")
+    trajectory_id: UUID | None = Field(
+        default=None, description="Server-authoritative execution trajectory identifier (Phase 6)"
+    )
 
     # Context & Proposal Information
     agent_id: str
@@ -105,11 +114,11 @@ class AgentAction(BaseModel):
     goal: str | None = None
     current_task: str | None = None
 
-    action_type: ActionType
+    action_type: ActionType = Field(default=ActionType.TOOL_CALL)
     tool_name: str
     tool_arguments: dict[str, Any] = Field(default_factory=dict)
     target_resource: str | None = None
-    target_environment: TargetEnvironment
+    target_environment: TargetEnvironment = Field(default=TargetEnvironment.DEVELOPMENT)
 
     # Validated Lineage
     parent_action_id: UUID | None = None
@@ -117,11 +126,23 @@ class AgentAction(BaseModel):
     input_sources: list[str] = Field(default_factory=list)
     influenced_by: list[str] = Field(default_factory=list)
 
-    input_trust_level: TrustLevel
+    input_trust_level: TrustLevel = Field(default=TrustLevel.MEDIUM)
     data_classifications: list[DataClassification] = Field(default_factory=list)
     delegation_chain: list[str] = Field(default_factory=list)
     capability_id: str | None = None
     expected_effect: str | None = None
+
+    # Phase 5 Information Provenance
+    attempted_input_artifact_ids: list[UUID] = Field(
+        default_factory=list, description="Client-submitted input artifact IDs before validation"
+    )
+    validated_input_artifact_ids: list[UUID] = Field(
+        default_factory=list, description="Server-validated authoritative input artifact IDs"
+    )
+    output_artifact_ids: list[UUID] = Field(
+        default_factory=list,
+        description="Authoritative output artifact IDs produced by execution",
+    )
 
     # Server-Authoritative Governance Fields
     risk_score: float = Field(default=0.0, ge=0.0, le=1.0)
@@ -136,12 +157,16 @@ class AgentAction(BaseModel):
 
     @classmethod
     def from_proposal(
-        cls, proposal: AgentActionProposal, action_id: UUID | None = None
+        cls,
+        proposal: AgentActionProposal,
+        action_id: UUID | None = None,
+        trajectory_id: UUID | None = None,
     ) -> "AgentAction":
         """Instantiate an authoritative AgentAction from a client proposal."""
         return cls(
             action_id=action_id or uuid4(),
-            client_action_id=proposal.client_action_id,
+            client_action_id=proposal.client_action_id or proposal.client_correlation_id,
+            trajectory_id=trajectory_id,
             agent_id=proposal.agent_id,
             agent_instance_id=proposal.agent_instance_id,
             session_id=proposal.session_id,
@@ -163,5 +188,8 @@ class AgentAction(BaseModel):
             delegation_chain=proposal.delegation_chain,
             capability_id=proposal.capability_id,
             expected_effect=proposal.expected_effect,
+            attempted_input_artifact_ids=list(proposal.input_artifact_ids),
+            validated_input_artifact_ids=[],
+            output_artifact_ids=[],
             execution_status=ToolExecutionStatus.PROPOSED,
         )

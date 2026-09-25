@@ -425,7 +425,7 @@ def test_allow_consumes_exactly_one_execution_slot(
         session_id=session_id,
         tool_name="web.search",
     )
-    _, decision1 = strict_gateway.evaluate_proposal(proposal1)
+    action1, decision1 = strict_gateway.evaluate_proposal(proposal1)
     assert decision1.decision == PolicyDecision.ALLOW
 
     updated1 = intent_service.get_intent(contract.intent_id)
@@ -437,6 +437,7 @@ def test_allow_consumes_exactly_one_execution_slot(
         agent_id="agent-01",
         session_id=session_id,
         tool_name="web.search",
+        parent_action_id=action1.action_id,
     )
     _, decision2 = strict_gateway.evaluate_proposal(proposal2)
     assert decision2.decision == PolicyDecision.ALLOW

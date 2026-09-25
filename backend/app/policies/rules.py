@@ -24,7 +24,11 @@ from app.schemas.enums import (
 
 if TYPE_CHECKING:
     from app.schemas.intent import IntentContract
-    from app.schemas.policy import PolicyGraphContext
+    from app.schemas.policy import (
+        PolicyGraphContext,
+        PolicyProvenanceContext,
+        PolicyTrajectoryContext,
+    )
 
 
 @dataclass(frozen=True)
@@ -41,7 +45,10 @@ class DeterministicPolicyEvaluator:
     """Deterministic policy evaluator for CAGE governance."""
 
     def __init__(self, tool_registry: ToolRegistry | None = None) -> None:
+        from app.policies.intent_rules import IntentRulesEvaluator
+
         self.tool_registry = tool_registry or default_tool_registry
+        self.intent_evaluator = IntentRulesEvaluator(tool_registry=self.tool_registry)
 
     def evaluate(
         self,
@@ -50,6 +57,8 @@ class DeterministicPolicyEvaluator:
         require_intent: bool = False,
         intent_mismatch: bool = False,
         graph_context: PolicyGraphContext | None = None,
+        provenance_context: PolicyProvenanceContext | None = None,
+        trajectory_context: PolicyTrajectoryContext | None = None,
     ) -> SecurityDecision:
         """Evaluate an authoritative AgentAction against Intent rules and runtime policies.
 
@@ -57,15 +66,14 @@ class DeterministicPolicyEvaluator:
         according to the severity rank hierarchy:
         DENY > QUARANTINE > SANDBOX > REQUIRE_APPROVAL > ALLOW_WITH_LIMITS > ALLOW.
         """
+
         tool_spec = self.tool_registry.get(action.tool_name)
         matched_rules: list[MatchedRule] = []
 
         # =============================================================
         # 1. Intent Scope Evaluation (Task Authority)
         # =============================================================
-        from app.policies.intent_rules import default_intent_rules_evaluator
-
-        intent_matched = default_intent_rules_evaluator.evaluate_intent(
+        intent_matched = self.intent_evaluator.evaluate_intent(
             action=action,
             contract=contract,
             require_intent=require_intent,
@@ -259,6 +267,242 @@ class DeterministicPolicyEvaluator:
                         risk_score=0.75,
                     )
                 )
+
+        # =============================================================
+        # 3. Provenance & Data Flow Security Policies (Phase 5 Rules)
+        # =============================================================
+        if provenance_context is not None:
+            # ---------------------------------------------------------
+            # Provenance Analysis Failure Guard (Fail-Closed)
+            # ---------------------------------------------------------
+            if (
+                not provenance_context.analysis_complete
+                or provenance_context.analysis_status != "SUCCESS"
+            ):
+                status_str = (
+                    provenance_context.analysis_status.value
+                    if hasattr(provenance_context.analysis_status, "value")
+                    else str(provenance_context.analysis_status)
+                )
+                rule_id_map = {
+                    "DEPTH_LIMIT_EXCEEDED": "RULE_PROVENANCE_DEPTH_LIMIT_EXCEEDED",
+                    "ARTIFACT_LIMIT_EXCEEDED": "RULE_PROVENANCE_ARTIFACT_LIMIT_EXCEEDED",
+                    "MISSING_ARTIFACT": "RULE_PROVENANCE_MISSING_ARTIFACT",
+                    "CROSS_SESSION_REFERENCE": "RULE_PROVENANCE_CROSS_SESSION_REFERENCE",
+                    "INVALID_LINEAGE": "RULE_PROVENANCE_INVALID_LINEAGE",
+                    "CYCLE_DETECTED": "RULE_PROVENANCE_CYCLE_DETECTED",
+                    "UNTRACKED_PAYLOAD": "RULE_PROVENANCE_UNTRACKED_EGRESS",
+                }
+                fail_rule_id = rule_id_map.get(status_str, "RULE_PROVENANCE_ANALYSIS_FAILED")
+                matched_rules.append(
+                    MatchedRule(
+                        rule_id=fail_rule_id,
+                        decision=PolicyDecision.DENY,
+                        reason=f"Provenance analysis failed ({status_str}). Fail-closed enforced.",
+                        risk_score=0.99 if "CYCLE" in status_str else 0.95,
+                    )
+                )
+
+            # ---------------------------------------------------------
+            # Rule: Untracked External Egress Guard
+            # ---------------------------------------------------------
+            if (
+                tool_spec.external_sink
+                and tool_spec.requires_tracked_inputs
+                and provenance_context.payload_binding_required
+                and not provenance_context.payload_binding_satisfied
+            ):
+                matched_rules.append(
+                    MatchedRule(
+                        rule_id="RULE_PROVENANCE_UNTRACKED_EGRESS",
+                        decision=PolicyDecision.DENY,
+                        reason="External egress denied: tool requires tracked input payload binding, but no valid artifact-backed payload was satisfied.",
+                        risk_score=0.95,
+                    )
+                )
+
+            # ---------------------------------------------------------
+            # Rule: Credential to External Sink Guard
+            # ---------------------------------------------------------
+            if tool_spec.external_sink and provenance_context.contains_credential_input:
+                matched_rules.append(
+                    MatchedRule(
+                        rule_id="RULE_PROVENANCE_CREDENTIAL_TO_EXTERNAL",
+                        decision=PolicyDecision.DENY,
+                        reason="External transmission denied: consumed input artifacts contain CREDENTIAL classified information.",
+                        risk_score=0.95,
+                    )
+                )
+
+            # ---------------------------------------------------------
+            # Rule: Sensitive Data to External Sink Guard
+            # ---------------------------------------------------------
+            if tool_spec.external_sink and provenance_context.contains_sensitive_input:
+                matched_rules.append(
+                    MatchedRule(
+                        rule_id="RULE_PROVENANCE_SENSITIVE_TO_EXTERNAL",
+                        decision=PolicyDecision.DENY,
+                        reason="External transmission denied: consumed input artifacts contain sensitive data classifications.",
+                        risk_score=0.90,
+                    )
+                )
+
+            # ---------------------------------------------------------
+            # Rule: Untrusted Origin to Privileged Action Guard
+            # ---------------------------------------------------------
+            if provenance_context.contains_untrusted_input and is_privileged_or_destructive:
+                matched_rules.append(
+                    MatchedRule(
+                        rule_id="RULE_PROVENANCE_UNTRUSTED_TO_PRIVILEGED",
+                        decision=PolicyDecision.REQUIRE_APPROVAL,
+                        reason="Privileged or destructive action consumes information with untrusted external provenance.",
+                        risk_score=0.80,
+                    )
+                )
+
+            # ---------------------------------------------------------
+            # Rule: Unknown Origin to Privileged Action Guard
+            # ---------------------------------------------------------
+            if provenance_context.contains_unknown_input and is_privileged_or_destructive:
+                matched_rules.append(
+                    MatchedRule(
+                        rule_id="RULE_PROVENANCE_UNKNOWN_TO_PRIVILEGED",
+                        decision=PolicyDecision.REQUIRE_APPROVAL,
+                        reason="Privileged or destructive action consumes information with unknown provenance origin.",
+                        risk_score=0.75,
+                    )
+                )
+
+        # =============================================================
+        # Phase 6: Trajectory Governance & Action-Chain Policies
+        # =============================================================
+        if trajectory_context is not None:
+            # 1. Trajectory Lifecycle Enforcement Rules
+            if trajectory_context.trajectory_status == "QUARANTINED":
+                matched_rules.append(
+                    MatchedRule(
+                        rule_id="RULE_TRAJECTORY_QUARANTINED",
+                        decision=PolicyDecision.DENY,
+                        reason="Action rejected because trajectory is in QUARANTINED containment state.",
+                        risk_score=1.0,
+                    )
+                )
+
+            if trajectory_context.trajectory_status == "ABORTED":
+                matched_rules.append(
+                    MatchedRule(
+                        rule_id="RULE_TRAJECTORY_ABORTED",
+                        decision=PolicyDecision.DENY,
+                        reason="Action rejected because trajectory has been permanently ABORTED.",
+                        risk_score=1.0,
+                    )
+                )
+
+            # 2. Trajectory Traversal Limits & Fail-Closed Errors
+            if not trajectory_context.analysis_complete:
+                status_str = (
+                    trajectory_context.analysis_status.value
+                    if hasattr(trajectory_context.analysis_status, "value")
+                    else str(trajectory_context.analysis_status)
+                )
+                rule_map = {
+                    "ACTION_DEPTH_LIMIT_EXCEEDED": (
+                        "RULE_TRAJECTORY_ACTION_DEPTH_LIMIT_EXCEEDED",
+                        "Trajectory action traversal depth exceeded safety limits.",
+                    ),
+                    "ARTIFACT_DEPTH_LIMIT_EXCEEDED": (
+                        "RULE_TRAJECTORY_ARTIFACT_DEPTH_LIMIT_EXCEEDED",
+                        "Trajectory artifact derivation depth exceeded safety limits.",
+                    ),
+                    "NODE_LIMIT_EXCEEDED": (
+                        "RULE_TRAJECTORY_NODE_LIMIT_EXCEEDED",
+                        "Trajectory graph traversal node limit exceeded safety limits.",
+                    ),
+                    "INVALID_TYPED_PATH": (
+                        "RULE_TRAJECTORY_INVALID_TYPED_PATH",
+                        "Trajectory contains invalid or broken typed edge relations.",
+                    ),
+                    "MISSING_GRAPH_EVIDENCE": (
+                        "RULE_TRAJECTORY_MISSING_GRAPH_EVIDENCE",
+                        "Trajectory causal history contains missing or corrupted graph nodes.",
+                    ),
+                    "INCONSISTENT_PROVENANCE": (
+                        "RULE_TRAJECTORY_INCONSISTENT_PROVENANCE",
+                        "Trajectory references inconsistent or missing provenance artifacts.",
+                    ),
+                }
+                rule_id, reason = rule_map.get(
+                    status_str,
+                    ("RULE_TRAJECTORY_ANALYSIS_FAILED", "Trajectory security analysis failed."),
+                )
+                matched_rules.append(
+                    MatchedRule(
+                        rule_id=rule_id,
+                        decision=PolicyDecision.DENY,
+                        reason=reason,
+                        risk_score=0.95,
+                    )
+                )
+
+            # 3. Flagship Trajectory Security Policies
+            if trajectory_context.analysis_complete:
+                # Flagship 1: Untrusted causal path leading to sensitive internal access
+                if trajectory_context.untrusted_path_to_sensitive_access:
+                    matched_rules.append(
+                        MatchedRule(
+                            rule_id="RULE_TRAJECTORY_UNTRUSTED_PATH_TO_SENSITIVE_ACCESS",
+                            decision=PolicyDecision.REQUIRE_APPROVAL,
+                            reason="Externally untrusted information participated in the validated causal trajectory leading to sensitive access.",
+                            risk_score=0.85,
+                        )
+                    )
+
+                # Flagship 2: Untrusted causal path leading to sensitive external egress
+                if trajectory_context.untrusted_path_to_sensitive_egress:
+                    matched_rules.append(
+                        MatchedRule(
+                            rule_id="RULE_TRAJECTORY_UNTRUSTED_PATH_TO_SENSITIVE_EGRESS",
+                            decision=PolicyDecision.DENY,
+                            reason="Validated causal trajectory connects externally untrusted origin to sensitive external egress sink.",
+                            risk_score=0.95,
+                        )
+                    )
+
+                # Flagship 3: Information cannot expand authority
+                if (
+                    trajectory_context.unauthorized_authority_expansion_attempted
+                    and trajectory_context.untrusted_path_to_current_action
+                ):
+                    matched_rules.append(
+                        MatchedRule(
+                            rule_id="RULE_TRAJECTORY_INFORMATION_CANNOT_EXPAND_AUTHORITY",
+                            decision=PolicyDecision.DENY,
+                            reason="Untrusted information on causal trajectory attempted unauthorized authority expansion.",
+                            risk_score=0.90,
+                        )
+                    )
+
+                # Flagship 4: Cumulative sensitive egress attempts threshold exceeded
+                if trajectory_context.split_exfiltration_threshold_exceeded:
+                    matched_rules.append(
+                        MatchedRule(
+                            rule_id="RULE_TRAJECTORY_CUMULATIVE_SENSITIVE_EGRESS",
+                            decision=PolicyDecision.QUARANTINE,
+                            reason="Cumulative sensitive egress attempts or volume exceeded safety thresholds; quarantining trajectory.",
+                            risk_score=0.95,
+                        )
+                    )
+
+                # Flagship 5: Sensitive hop laundering
+                if trajectory_context.sensitive_hop_laundering_detected:
+                    matched_rules.append(
+                        MatchedRule(
+                            rule_id="RULE_TRAJECTORY_SENSITIVE_HOP_LAUNDERING",
+                            decision=PolicyDecision.DENY,
+                            reason="Sensitive information traversed multi-hop transformation sequence before exiting to external sink.",
+                            risk_score=0.90,
+                        )
+                    )
 
         # -------------------------------------------------------------
         # Rule D: Normal Low-Risk Baseline

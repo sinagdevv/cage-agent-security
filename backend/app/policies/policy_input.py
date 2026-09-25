@@ -11,8 +11,10 @@ from app.schemas.policy import (
     PolicyDataContext,
     PolicyGraphContext,
     PolicyIntentContext,
+    PolicyProvenanceContext,
     PolicyRuntimeContext,
     PolicyToolContext,
+    PolicyTrajectoryContext,
 )
 
 
@@ -23,6 +25,8 @@ def build_cage_policy_input(
     require_intent: bool = True,
     intent_mismatch: bool = False,
     graph_context: PolicyGraphContext | None = None,
+    provenance_context: PolicyProvenanceContext | None = None,
+    trajectory_context: PolicyTrajectoryContext | None = None,
 ) -> CagePolicyInput:
     """Build the single authoritative CagePolicyInput document for an evaluated action.
 
@@ -72,6 +76,11 @@ def build_cage_policy_input(
     server_classifications = (
         [tool_spec.default_classification.value] if tool_spec.default_classification else []
     )
+    binding_mode = (
+        tool_spec.payload_binding_mode.value
+        if hasattr(tool_spec.payload_binding_mode, "value")
+        else str(tool_spec.payload_binding_mode)
+    )
     tool_ctx = PolicyToolContext(
         known=tool_spec.known,
         privileged=tool_spec.privileged,
@@ -79,6 +88,8 @@ def build_cage_policy_input(
         external_sink=tool_spec.external_sink,
         resource_scoped=tool_spec.resource_scoped,
         server_known_classifications=server_classifications,
+        requires_tracked_inputs=tool_spec.requires_tracked_inputs,
+        payload_binding_mode=binding_mode,
     )
 
     # 5. Data context (Server-known UNION client-declared)
@@ -98,6 +109,8 @@ def build_cage_policy_input(
     )
 
     graph_ctx = graph_context or PolicyGraphContext()
+    prov_ctx = provenance_context or PolicyProvenanceContext()
+    traj_ctx = trajectory_context or PolicyTrajectoryContext()
 
     return CagePolicyInput(
         action=action_ctx,
@@ -107,4 +120,6 @@ def build_cage_policy_input(
         data=data_ctx,
         context=runtime_ctx,
         graph=graph_ctx,
+        provenance=prov_ctx,
+        trajectory=traj_ctx,
     )

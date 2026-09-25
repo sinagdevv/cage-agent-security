@@ -21,7 +21,6 @@ from app.gateway.registry import ToolRegistry, ToolSpec
 from app.gateway.service import AgentGateway
 from app.graph.analyzer import GraphSecurityAnalyzer
 from app.graph.causal_graph import (
-    CausalExecutionGraph,
     GraphCycleError,
     SessionGraphManager,
 )
@@ -36,7 +35,6 @@ from app.schemas.enums import (
     GraphRelation,
     PolicyBackend,
     PolicyDecision,
-    PolicyParityStatus,
     TargetEnvironment,
 )
 from app.schemas.intent import IntentContractCreate
@@ -83,6 +81,7 @@ def setup_demo_environment():
 
     # Configure OPA client adapter for reproducible demo execution
     from unittest.mock import MagicMock
+
     from app.policies.opa_client import OpaClient
     from app.schemas.enums import OpaStatus
     from app.schemas.policy import OpaEvaluationResult, OpaFinding

@@ -35,6 +35,8 @@ class ToolResult:
     output: Any
     error: str | None = None
     simulated: bool = True
+    mime_type: str | None = None
+    source_resource: str | None = None
 
 
 class ToolExecutor:
@@ -72,6 +74,8 @@ class ToolExecutor:
                     }
                 ],
             },
+            mime_type="application/json",
+            source_resource="public-web",
         )
 
     def _execute_file_read(self, args: dict[str, Any]) -> ToolResult:
@@ -80,6 +84,8 @@ class ToolExecutor:
             tool_name="file.read",
             success=True,
             output={"path": path, "content": f"[Simulated Content of {path}]"},
+            mime_type="text/plain",
+            source_resource=f"file://{path}",
         )
 
     def _execute_file_write(self, args: dict[str, Any]) -> ToolResult:
@@ -88,6 +94,8 @@ class ToolExecutor:
             tool_name="file.write",
             success=True,
             output={"path": path, "bytes_written": len(str(args.get("content", "")))},
+            mime_type="text/plain",
+            source_resource=f"file://{path}",
         )
 
     def _execute_database_read(self, args: dict[str, Any]) -> ToolResult:
@@ -96,14 +104,38 @@ class ToolExecutor:
             tool_name="database.read",
             success=True,
             output={"table": table, "rows": [{"id": 1, "status": "active"}]},
+            mime_type="application/json",
+            source_resource="customer-db",
+        )
+
+    def _execute_agent_transform(self, args: dict[str, Any]) -> ToolResult:
+        content = args.get("content", args.get("body", "synthesized summary"))
+        return ToolResult(
+            tool_name="agent.transform",
+            success=True,
+            output={"summary": f"Summary of: {content}", "status": "transformed"},
+            mime_type="application/json",
+            source_resource="agent-memory",
+        )
+
+    def _execute_secrets_vault_read(self, args: dict[str, Any]) -> ToolResult:
+        key = args.get("secret_key", "default_api_key")
+        return ToolResult(
+            tool_name="secrets.vault_read",
+            success=True,
+            output={"secret_key": key, "token": "sk-proj-credential-vault-token-xyz"},
+            mime_type="application/json",
+            source_resource="secrets-vault",
         )
 
     def _execute_external_http_post(self, args: dict[str, Any]) -> ToolResult:
-        url = args.get("url", "https://api.example.com")
+        url = args.get("url", args.get("destination", "https://api.example.com"))
         return ToolResult(
             tool_name="external.http_post",
             success=True,
             output={"url": url, "status_code": 200, "response": "ok"},
+            mime_type="application/json",
+            source_resource=url,
         )
 
     def _execute_system_delete_resource(self, args: dict[str, Any]) -> ToolResult:

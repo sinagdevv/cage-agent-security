@@ -11,6 +11,7 @@ State will be lost upon server restart and is not intended for distributed produ
 import threading
 from datetime import UTC, datetime
 from typing import Any
+from uuid import UUID
 
 import networkx as nx
 
@@ -36,6 +37,10 @@ class GraphCycleError(ValueError):
 
 class GraphTraversalLimitError(ValueError):
     """Raised when a graph traversal exceeds configured depth or node limits."""
+
+
+class ProvenanceCycleError(ValueError):
+    """Raised when an artifact derivation edge would create a cycle in the provenance graph."""
 
 
 class CausalExecutionGraph:
@@ -106,6 +111,146 @@ class CausalExecutionGraph:
         if not self._graph.has_node(action_id):
             raise KeyError(f"Action node '{action_id}' does not exist in session graph.")
         self._graph.add_edge(intent_id, action_id, relation=GraphRelation.GOVERNS.value)
+
+    def add_artifact_node(self, artifact: Any) -> None:
+        """Record an InformationArtifact as an authoritative data provenance node.
+
+        Security: Raw payloads and sensitive content digests are excluded from graph attributes.
+        """
+        art_id = str(artifact.artifact_id)
+        if not self._graph.has_node(art_id):
+            self._graph.add_node(
+                art_id,
+                node_type=GraphNodeType.ARTIFACT.value,
+                artifact_id=art_id,
+                session_id=artifact.session_id,
+                source_type=artifact.source_type.value
+                if hasattr(artifact.source_type, "value")
+                else str(artifact.source_type),
+                source_resource=artifact.source_resource,
+                direct_trust_level=artifact.direct_trust_level.value
+                if hasattr(artifact.direct_trust_level, "value")
+                else str(artifact.direct_trust_level),
+                inherited_trust_levels=[
+                    t.value if hasattr(t, "value") else str(t)
+                    for t in artifact.inherited_trust_levels
+                ],
+                data_classifications=[
+                    c.value if hasattr(c, "value") else str(c)
+                    for c in artifact.data_classifications
+                ],
+                size_bytes=artifact.size_bytes,
+                mime_type=artifact.mime_type,
+                created_at=artifact.created_at.isoformat()
+                if hasattr(artifact.created_at, "isoformat")
+                else str(artifact.created_at),
+            )
+
+    def add_produces_edge(self, action_id: str, artifact_id: str) -> None:
+        """Record that an authorized action generated an artifact: Action --PRODUCES--> Artifact."""
+        if not self._graph.has_node(action_id):
+            raise KeyError(f"Action node '{action_id}' does not exist in session graph.")
+        if not self._graph.has_node(artifact_id):
+            raise KeyError(f"Artifact node '{artifact_id}' does not exist in session graph.")
+        self._graph.add_edge(action_id, artifact_id, relation=GraphRelation.PRODUCES.value)
+
+    def add_consumes_edge(self, artifact_id: str, action_id: str) -> None:
+        """Record that an authorized action consumed an artifact: Artifact --CONSUMES--> Action."""
+        if not self._graph.has_node(artifact_id):
+            raise KeyError(f"Artifact node '{artifact_id}' does not exist in session graph.")
+        if not self._graph.has_node(action_id):
+            raise KeyError(f"Action node '{action_id}' does not exist in session graph.")
+        self._graph.add_edge(artifact_id, action_id, relation=GraphRelation.CONSUMES.value)
+
+    def add_derived_from_edge(self, child_artifact_id: str, parent_artifact_id: str) -> None:
+        """Record derivation lineage: ChildArtifact --DERIVED_FROM--> ParentArtifact.
+
+        Enforces cycle prevention: raises ProvenanceCycleError if parent has a path to child.
+        """
+        if not self._graph.has_node(child_artifact_id):
+            raise KeyError(f"Child artifact node '{child_artifact_id}' does not exist.")
+        if not self._graph.has_node(parent_artifact_id):
+            raise KeyError(f"Parent artifact node '{parent_artifact_id}' does not exist.")
+
+        derived_graph = nx.subgraph_view(
+            self._graph,
+            filter_edge=lambda u, v: (
+                self._graph[u][v].get("relation") == GraphRelation.DERIVED_FROM.value
+            ),
+        )
+        if nx.has_path(derived_graph, parent_artifact_id, child_artifact_id):
+            raise ProvenanceCycleError(
+                f"Cyclic derivation detected: adding edge from '{child_artifact_id}' to '{parent_artifact_id}' "
+                f"would create a cycle in session '{self.session_id}'."
+            )
+        self._graph.add_edge(
+            child_artifact_id, parent_artifact_id, relation=GraphRelation.DERIVED_FROM.value
+        )
+
+    def get_artifact_parents(self, artifact_id: str) -> list[str]:
+        """Get immediate parent artifacts via outgoing DERIVED_FROM edges."""
+        if not self._graph.has_node(artifact_id):
+            return []
+        return [
+            v
+            for _, v, data in self._graph.out_edges(artifact_id, data=True)
+            if data.get("relation") == GraphRelation.DERIVED_FROM.value
+        ]
+
+    def get_artifact_children(self, artifact_id: str) -> list[str]:
+        """Get immediate children derived from this artifact via incoming DERIVED_FROM edges."""
+        if not self._graph.has_node(artifact_id):
+            return []
+        return [
+            u
+            for u, _, data in self._graph.in_edges(artifact_id, data=True)
+            if data.get("relation") == GraphRelation.DERIVED_FROM.value
+        ]
+
+    def get_artifact_producer(self, artifact_id: str) -> str | None:
+        """Get action that produced this artifact via incoming PRODUCES edge."""
+        if not self._graph.has_node(artifact_id):
+            return None
+        for u, _, data in self._graph.in_edges(artifact_id, data=True):
+            if data.get("relation") == GraphRelation.PRODUCES.value:
+                return u
+        return None
+
+    def get_artifact_consumers(self, artifact_id: str) -> list[str]:
+        """Get actions that consumed this artifact via outgoing CONSUMES edges."""
+        if not self._graph.has_node(artifact_id):
+            return []
+        return [
+            v
+            for _, v, data in self._graph.out_edges(artifact_id, data=True)
+            if data.get("relation") == GraphRelation.CONSUMES.value
+        ]
+
+    def get_action_inputs(self, action_id: str) -> list[str]:
+        """Get artifacts consumed by this action via incoming CONSUMES edges."""
+        if not self._graph.has_node(action_id):
+            return []
+        return [
+            u
+            for u, _, data in self._graph.in_edges(action_id, data=True)
+            if data.get("relation") == GraphRelation.CONSUMES.value
+        ]
+
+    def get_action_outputs(self, action_id: str) -> list[str]:
+        """Get artifacts produced by this action via outgoing PRODUCES edges."""
+        if not self._graph.has_node(action_id):
+            return []
+        return [
+            v
+            for _, v, data in self._graph.out_edges(action_id, data=True)
+            if data.get("relation") == GraphRelation.PRODUCES.value
+        ]
+
+    def has_data_flow_path(self, source_artifact_id: str, target_node_id: str) -> bool:
+        """Check if any directed data-flow path exists from source artifact to target."""
+        if not self._graph.has_node(source_artifact_id) or not self._graph.has_node(target_node_id):
+            return False
+        return nx.has_path(self._graph, source_artifact_id, target_node_id)
 
     def add_action(
         self,
@@ -212,6 +357,17 @@ class CausalExecutionGraph:
             node_attrs["policy_version"] = policy_version
         if policy_input_schema_version is not None:
             node_attrs["policy_input_schema_version"] = policy_input_schema_version
+
+    def add_action_output_artifact(self, action_id: str, artifact_id: UUID) -> None:
+        """Record an output artifact generated by a successfully executed action."""
+        if action_id in self._actions:
+            if artifact_id not in self._actions[action_id].output_artifact_ids:
+                self._actions[action_id].output_artifact_ids.append(artifact_id)
+        if self._graph.has_node(action_id):
+            existing = list(self._graph.nodes[action_id].get("output_artifact_ids") or [])
+            if str(artifact_id) not in existing:
+                existing.append(str(artifact_id))
+            self._graph.nodes[action_id]["output_artifact_ids"] = existing
 
     def add_relationship(
         self,
@@ -360,9 +516,43 @@ class CausalExecutionGraph:
         """Return total number of edges in the graph."""
         return self._graph.number_of_edges()
 
+    def is_action_causality_dag(self) -> bool:
+        """Check if the action causality subgraph (CAUSES edges) is an acyclic DAG."""
+        causes_graph = nx.subgraph_view(
+            self._graph,
+            filter_edge=lambda u, v: (
+                self._graph[u][v].get("relation") in (GraphRelation.CAUSES.value, "causes")
+            ),
+        )
+        return nx.is_directed_acyclic_graph(causes_graph)
+
+    def is_artifact_lineage_dag(self) -> bool:
+        """Check if the artifact derivation lineage subgraph (DERIVED_FROM edges) is an acyclic DAG."""
+        derived_graph = nx.subgraph_view(
+            self._graph,
+            filter_edge=lambda u, v: (
+                self._graph[u][v].get("relation") == GraphRelation.DERIVED_FROM.value
+            ),
+        )
+        return nx.is_directed_acyclic_graph(derived_graph)
+
+    def has_valid_typed_dags(self) -> bool:
+        """Check that all relation-specific typed subgraphs satisfy DAG invariants.
+
+        Specifically:
+        1. Action causality subgraph (CAUSES edges) must be a DAG.
+        2. Artifact derivation lineage subgraph (DERIVED_FROM edges) must be a DAG.
+        Note: The full heterogeneous graph is NOT required to be acyclic across different relation types.
+        """
+        return self.is_action_causality_dag() and self.is_artifact_lineage_dag()
+
     def is_dag(self) -> bool:
-        """Check if the execution graph is a valid Directed Acyclic Graph."""
-        return nx.is_directed_acyclic_graph(self._graph)
+        """Check action causality DAG integrity (action causality subgraph).
+
+        Note: is_dag() validates relation-specific DAG invariants (specifically CAUSES),
+        NOT that the complete heterogeneous NetworkX graph is acyclic across distinct semantic relations.
+        """
+        return self.is_action_causality_dag()
 
     def get_session_graph(self) -> dict[str, Any]:
         """Serialize current session trajectory graph to JSON-friendly representation."""

@@ -56,9 +56,9 @@ class GraphSecurityAnalyzer:
                 has_high_environment_ancestor=False,
             )
 
-        # Check DAG validity before traversal
-        if not graph.is_dag():
-            logger.error("Causal graph is not a valid DAG during security analysis.")
+        # Check action causality DAG validity before traversal
+        if not graph.is_action_causality_dag():
+            logger.error("Action causality graph is not a valid DAG during security analysis.")
             return PolicyGraphContext(
                 analysis_status=GraphAnalysisStatus.INVALID_GRAPH,
                 analysis_complete=False,

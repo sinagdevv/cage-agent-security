@@ -5,7 +5,22 @@ Prevents AI agents from spoofing destructive, privileged, or external-sink attri
 
 from dataclasses import dataclass
 
-from app.schemas.enums import DataClassification
+from app.schemas.enums import ArtifactSourceType, DataClassification, PayloadBindingMode
+
+DEFAULT_ALLOWED_DESTINATION_PATHS: frozenset[str] = frozenset(
+    {
+        "",
+        "/",
+        "/upload",
+        "/submit",
+        "/test",
+        "/collect",
+        "/report",
+        "/exfil",
+        "/raw",
+        "/sink",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -21,6 +36,18 @@ class ToolSpec:
     default_classification: DataClassification | None = None
     description: str = ""
 
+    # Phase 5 Information Provenance & Egress Binding Fields
+    requires_tracked_inputs: bool = False
+    payload_binding_mode: PayloadBindingMode = PayloadBindingMode.NONE
+    payload_argument_names: frozenset[str] = frozenset()
+    allowed_destination_paths: frozenset[str] = DEFAULT_ALLOWED_DESTINATION_PATHS
+    produces_artifact: bool = True
+    output_derives_from_inputs: bool = False
+    output_source_type: ArtifactSourceType = ArtifactSourceType.TOOL_RESULT
+
+    # Phase 6 Trajectory & Prospective Sensitivity Fields
+    reads_resource_data: bool = False
+
 
 class ToolRegistry:
     """Trusted in-memory registry of known tools and their security characteristics."""
@@ -30,7 +57,7 @@ class ToolRegistry:
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
-        """Register the standard Phase 1 and Phase 2 simulated tools."""
+        """Register the standard Phase 1 through Phase 5 simulated tools."""
         defaults = [
             ToolSpec(
                 name="web.search",
@@ -41,6 +68,11 @@ class ToolRegistry:
                 resource_scoped=False,
                 default_classification=DataClassification.PUBLIC,
                 description="Search public web information",
+                requires_tracked_inputs=False,
+                payload_binding_mode=PayloadBindingMode.NONE,
+                produces_artifact=True,
+                output_derives_from_inputs=False,
+                output_source_type=ArtifactSourceType.EXTERNAL_CONTENT,
             ),
             ToolSpec(
                 name="file.read",
@@ -51,6 +83,11 @@ class ToolRegistry:
                 resource_scoped=True,
                 default_classification=None,
                 description="Read local file contents",
+                requires_tracked_inputs=False,
+                payload_binding_mode=PayloadBindingMode.NONE,
+                produces_artifact=True,
+                output_derives_from_inputs=False,
+                output_source_type=ArtifactSourceType.FILE,
             ),
             ToolSpec(
                 name="file.write",
@@ -61,6 +98,11 @@ class ToolRegistry:
                 resource_scoped=True,
                 default_classification=None,
                 description="Write to local file path",
+                requires_tracked_inputs=False,
+                payload_binding_mode=PayloadBindingMode.NONE,
+                produces_artifact=True,
+                output_derives_from_inputs=True,
+                output_source_type=ArtifactSourceType.FILE,
             ),
             ToolSpec(
                 name="database.read",
@@ -71,6 +113,12 @@ class ToolRegistry:
                 resource_scoped=True,
                 default_classification=DataClassification.INTERNAL,
                 description="Query internal database tables",
+                requires_tracked_inputs=False,
+                payload_binding_mode=PayloadBindingMode.NONE,
+                produces_artifact=True,
+                output_derives_from_inputs=False,
+                output_source_type=ArtifactSourceType.DATABASE,
+                reads_resource_data=True,
             ),
             ToolSpec(
                 name="external.http_post",
@@ -81,6 +129,12 @@ class ToolRegistry:
                 resource_scoped=True,
                 default_classification=None,
                 description="Transmit HTTP payload to external endpoint",
+                requires_tracked_inputs=True,
+                payload_binding_mode=PayloadBindingMode.ARTIFACT_REQUIRED,
+                payload_argument_names=frozenset({"body", "data", "payload", "content"}),
+                produces_artifact=False,
+                output_derives_from_inputs=False,
+                output_source_type=ArtifactSourceType.TOOL_RESULT,
             ),
             ToolSpec(
                 name="system.delete_resource",
@@ -91,6 +145,42 @@ class ToolRegistry:
                 resource_scoped=True,
                 default_classification=None,
                 description="Delete a system or cloud resource",
+                requires_tracked_inputs=False,
+                payload_binding_mode=PayloadBindingMode.NONE,
+                produces_artifact=False,
+                output_derives_from_inputs=False,
+                output_source_type=ArtifactSourceType.SYSTEM,
+            ),
+            ToolSpec(
+                name="agent.transform",
+                known=True,
+                privileged=False,
+                destructive=False,
+                external_sink=False,
+                resource_scoped=False,
+                default_classification=None,
+                description="Agent summarization and data transformation",
+                requires_tracked_inputs=False,
+                payload_binding_mode=PayloadBindingMode.NONE,
+                produces_artifact=True,
+                output_derives_from_inputs=True,
+                output_source_type=ArtifactSourceType.AGENT_GENERATED,
+            ),
+            ToolSpec(
+                name="secrets.vault_read",
+                known=True,
+                privileged=True,
+                destructive=False,
+                external_sink=False,
+                resource_scoped=True,
+                default_classification=DataClassification.CREDENTIAL,
+                description="Read credentials from internal vault",
+                requires_tracked_inputs=False,
+                payload_binding_mode=PayloadBindingMode.NONE,
+                produces_artifact=True,
+                output_derives_from_inputs=False,
+                output_source_type=ArtifactSourceType.INTERNAL_RESOURCE,
+                reads_resource_data=True,
             ),
         ]
         for spec in defaults:

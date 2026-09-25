@@ -56,14 +56,130 @@ class PolicyDecision(StrEnum):
         return ranks[self]
 
 
-class TrustLevel(StrEnum):
-    """Trust tier of an input or execution origin."""
+class ProvenanceTrust(StrEnum):
+    """Authoritative information provenance and origin trust taxonomy (Phase 5)."""
+
+    TRUSTED_HUMAN = "TRUSTED_HUMAN"
+    TRUSTED_SYSTEM = "TRUSTED_SYSTEM"
+    INTERNAL_TRUSTED = "INTERNAL_TRUSTED"
+    EXTERNAL_UNTRUSTED = "EXTERNAL_UNTRUSTED"
+    AGENT_DERIVED = "AGENT_DERIVED"
+    UNKNOWN = "UNKNOWN"
+
+
+class LegacyTrustLevel(StrEnum):
+    """Legacy action-level input trust score (Phase 1)."""
 
     UNTRUSTED = "UNTRUSTED"
     LOW = "LOW"
     MEDIUM = "MEDIUM"
     HIGH = "HIGH"
     VERIFIED_HUMAN = "VERIFIED_HUMAN"
+
+
+class TrustLevel(StrEnum):
+    """Unified trust enum maintaining backward compatibility for legacy action tests."""
+
+    # Legacy action-level confidence tiers (Phase 1)
+    UNTRUSTED = "UNTRUSTED"
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+    VERIFIED_HUMAN = "VERIFIED_HUMAN"
+
+    # Canonical Phase 5 provenance trust taxonomy
+    TRUSTED_HUMAN = "TRUSTED_HUMAN"
+    TRUSTED_SYSTEM = "TRUSTED_SYSTEM"
+    INTERNAL_TRUSTED = "INTERNAL_TRUSTED"
+    EXTERNAL_UNTRUSTED = "EXTERNAL_UNTRUSTED"
+    AGENT_DERIVED = "AGENT_DERIVED"
+    UNKNOWN = "UNKNOWN"
+
+
+def normalize_to_provenance_trust(
+    trust: object,
+    source_type: object = None,
+    is_trusted_human_origin: bool = False,
+) -> ProvenanceTrust:
+    """Normalize an input trust score or origin indicator into a canonical ProvenanceTrust.
+
+    CRITICAL INVARIANT (Phase 5):
+    Legacy confidence/risk scores (LOW, MEDIUM, HIGH, VERIFIED_HUMAN, UNTRUSTED)
+    must NEVER manufacture factual provenance origin. If only a legacy trust score
+    is provided without authoritative provenance metadata, it normalizes to UNKNOWN.
+    """
+    raw_val = trust.value if hasattr(trust, "value") else str(trust)
+    src_val = (
+        source_type.value
+        if hasattr(source_type, "value")
+        else (str(source_type) if source_type else None)
+    )
+
+    # 1. Authoritative human ingestion path
+    if is_trusted_human_origin or src_val == "HUMAN_INPUT":
+        return ProvenanceTrust.TRUSTED_HUMAN
+
+    # 2. Authoritative external content ingestion
+    if src_val == "EXTERNAL_CONTENT":
+        return ProvenanceTrust.EXTERNAL_UNTRUSTED
+
+    # 3. Explicit legacy confidence/risk levels without authoritative provenance metadata -> UNKNOWN
+    if raw_val in (
+        LegacyTrustLevel.LOW.value,
+        LegacyTrustLevel.MEDIUM.value,
+        LegacyTrustLevel.HIGH.value,
+    ):
+        return ProvenanceTrust.UNKNOWN
+
+    if raw_val == LegacyTrustLevel.VERIFIED_HUMAN.value:
+        return ProvenanceTrust.TRUSTED_HUMAN if is_trusted_human_origin else ProvenanceTrust.UNKNOWN
+
+    if raw_val == LegacyTrustLevel.UNTRUSTED.value:
+        return (
+            ProvenanceTrust.EXTERNAL_UNTRUSTED
+            if src_val == "EXTERNAL_CONTENT"
+            else ProvenanceTrust.UNKNOWN
+        )
+
+    # 4. Canonical ProvenanceTrust origins
+    try:
+        return ProvenanceTrust(raw_val)
+    except ValueError:
+        return ProvenanceTrust.UNKNOWN
+
+
+class ArtifactSourceType(StrEnum):
+    """Origin category of an information artifact."""
+
+    HUMAN_INPUT = "HUMAN_INPUT"
+    TOOL_RESULT = "TOOL_RESULT"
+    EXTERNAL_CONTENT = "EXTERNAL_CONTENT"
+    INTERNAL_RESOURCE = "INTERNAL_RESOURCE"
+    AGENT_GENERATED = "AGENT_GENERATED"
+    FILE = "FILE"
+    DATABASE = "DATABASE"
+    SYSTEM = "SYSTEM"
+    UNKNOWN = "UNKNOWN"
+
+
+class PayloadBindingMode(StrEnum):
+    """Enforcement mode for binding tool payload parameters to validated artifacts."""
+
+    NONE = "NONE"
+    ARTIFACT_REQUIRED = "ARTIFACT_REQUIRED"
+
+
+class ProvenanceAnalysisStatus(StrEnum):
+    """Outcome status of provenance analysis and artifact lineage traversal."""
+
+    SUCCESS = "SUCCESS"
+    DEPTH_LIMIT_EXCEEDED = "DEPTH_LIMIT_EXCEEDED"
+    ARTIFACT_LIMIT_EXCEEDED = "ARTIFACT_LIMIT_EXCEEDED"
+    INVALID_LINEAGE = "INVALID_LINEAGE"
+    MISSING_ARTIFACT = "MISSING_ARTIFACT"
+    CROSS_SESSION_REFERENCE = "CROSS_SESSION_REFERENCE"
+    CYCLE_DETECTED = "CYCLE_DETECTED"
+    UNTRACKED_PAYLOAD = "UNTRACKED_PAYLOAD"
 
 
 class DataClassification(StrEnum):
@@ -128,6 +244,7 @@ class GraphNodeType(StrEnum):
 
     INTENT = "intent"
     ACTION = "action"
+    ARTIFACT = "artifact"
 
 
 class GraphRelation(StrEnum):
@@ -135,6 +252,9 @@ class GraphRelation(StrEnum):
 
     GOVERNS = "governs"
     CAUSES = "causes"
+    PRODUCES = "produces"
+    CONSUMES = "consumes"
+    DERIVED_FROM = "derived_from"
 
 
 class GraphAnalysisStatus(StrEnum):
@@ -145,3 +265,40 @@ class GraphAnalysisStatus(StrEnum):
     NODE_LIMIT_EXCEEDED = "NODE_LIMIT_EXCEEDED"
     INVALID_GRAPH = "INVALID_GRAPH"
     CYCLE_DETECTED = "CYCLE_DETECTED"
+
+
+class TrajectoryStatus(StrEnum):
+    """Authoritative lifecycle status of a CAGE execution trajectory."""
+
+    ACTIVE = "ACTIVE"
+    QUARANTINED = "QUARANTINED"
+    CLOSED = "CLOSED"
+    ABORTED = "ABORTED"
+
+
+class TrajectoryAnalysisStatus(StrEnum):
+    """Outcome status of trajectory security analysis and causal traversal."""
+
+    SUCCESS = "SUCCESS"
+    ACTION_DEPTH_LIMIT_EXCEEDED = "ACTION_DEPTH_LIMIT_EXCEEDED"
+    ARTIFACT_DEPTH_LIMIT_EXCEEDED = "ARTIFACT_DEPTH_LIMIT_EXCEEDED"
+    NODE_LIMIT_EXCEEDED = "NODE_LIMIT_EXCEEDED"
+    INVALID_TYPED_PATH = "INVALID_TYPED_PATH"
+    MISSING_GRAPH_EVIDENCE = "MISSING_GRAPH_EVIDENCE"
+    INCONSISTENT_PROVENANCE = "INCONSISTENT_PROVENANCE"
+
+
+class AuthorityScopeMode(StrEnum):
+    """Scope mode for authority capability constraints."""
+
+    UNCONSTRAINED = "UNCONSTRAINED"
+    ALLOWLIST = "ALLOWLIST"
+
+
+class AuthorityViolationType(StrEnum):
+    """Specific category of unauthorized authority expansion attempt."""
+
+    TOOL = "TOOL"
+    RESOURCE = "RESOURCE"
+    ENVIRONMENT = "ENVIRONMENT"
+    DATA_CLASSIFICATION = "DATA_CLASSIFICATION"
