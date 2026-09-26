@@ -12,7 +12,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from app.gateway.registry import ToolRegistry, default_tool_registry
 from app.schemas.action import AgentAction
 from app.schemas.decision import SecurityDecision
 from app.schemas.enums import (
@@ -23,8 +22,10 @@ from app.schemas.enums import (
 )
 
 if TYPE_CHECKING:
+    from app.gateway.registry import ToolRegistry
     from app.schemas.intent import IntentContract
     from app.schemas.policy import (
+        PolicyDelegationContext,
         PolicyGraphContext,
         PolicyProvenanceContext,
         PolicyTrajectoryContext,
@@ -45,9 +46,10 @@ class DeterministicPolicyEvaluator:
     """Deterministic policy evaluator for CAGE governance."""
 
     def __init__(self, tool_registry: ToolRegistry | None = None) -> None:
+        from app.gateway.registry import default_tool_registry
         from app.policies.intent_rules import IntentRulesEvaluator
 
-        self.tool_registry = tool_registry or default_tool_registry
+        self.tool_registry = tool_registry if tool_registry is not None else default_tool_registry
         self.intent_evaluator = IntentRulesEvaluator(tool_registry=self.tool_registry)
 
     def evaluate(
@@ -59,6 +61,7 @@ class DeterministicPolicyEvaluator:
         graph_context: PolicyGraphContext | None = None,
         provenance_context: PolicyProvenanceContext | None = None,
         trajectory_context: PolicyTrajectoryContext | None = None,
+        delegation_context: PolicyDelegationContext | None = None,
     ) -> SecurityDecision:
         """Evaluate an authoritative AgentAction against Intent rules and runtime policies.
 
@@ -78,6 +81,7 @@ class DeterministicPolicyEvaluator:
             contract=contract,
             require_intent=require_intent,
             intent_mismatch=intent_mismatch,
+            delegation_context=delegation_context,
         )
         matched_rules.extend(intent_matched)
 
@@ -127,7 +131,7 @@ class DeterministicPolicyEvaluator:
         # -------------------------------------------------------------
         # Rule C: Unknown Tool Privileged Access Guard
         # -------------------------------------------------------------
-        if not tool_spec.known:
+        if action.action_type != ActionType.DELEGATION and not tool_spec.known:
             if tool_spec.privileged or is_destructive or action.action_type == ActionType.EXECUTE:
                 matched_rules.append(
                     MatchedRule(
@@ -503,6 +507,253 @@ class DeterministicPolicyEvaluator:
                             risk_score=0.90,
                         )
                     )
+
+        # =============================================================
+        # 5. Multi-Agent Delegation Rules (Phase 8 Rules)
+        # =============================================================
+        if delegation_context is not None and delegation_context.is_delegated:
+            op = delegation_context.operation
+
+            if op == "CREATE_GRANT":
+                if not delegation_context.caller_is_authorized_issuer:
+                    matched_rules.append(
+                        MatchedRule(
+                            rule_id="RULE_DELEGATION_CALLER_NOT_AUTHORIZED",
+                            decision=PolicyDecision.DENY,
+                            reason="Caller principal is not authorized to issue this delegation grant.",
+                            risk_score=1.0,
+                        )
+                    )
+                if (
+                    delegation_context.parent_delegation_id is not None
+                    and not delegation_context.parent_grant_valid
+                ):
+                    matched_rules.append(
+                        MatchedRule(
+                            rule_id="RULE_DELEGATION_INVALID_PARENT",
+                            decision=PolicyDecision.DENY,
+                            reason="Referenced parent delegation grant does not exist or is invalid.",
+                            risk_score=1.0,
+                        )
+                    )
+                if not delegation_context.cross_session_match:
+                    matched_rules.append(
+                        MatchedRule(
+                            rule_id="RULE_DELEGATION_CROSS_SESSION",
+                            decision=PolicyDecision.DENY,
+                            reason="Delegation proposal references an intent or parent from a different session.",
+                            risk_score=1.0,
+                        )
+                    )
+                if (
+                    delegation_context.parent_delegation_id is not None
+                    and not delegation_context.subdelegation_allowed
+                ):
+                    matched_rules.append(
+                        MatchedRule(
+                            rule_id="RULE_DELEGATION_SUBDELEGATION_NOT_ALLOWED",
+                            decision=PolicyDecision.DENY,
+                            reason="Parent delegation grant explicitly prohibits creating child subdelegations.",
+                            risk_score=0.95,
+                        )
+                    )
+                if not delegation_context.depth_within_limits:
+                    matched_rules.append(
+                        MatchedRule(
+                            rule_id="RULE_DELEGATION_DEPTH_EXCEEDED",
+                            decision=PolicyDecision.DENY,
+                            reason="Requested delegation depth exceeds maximum allowed session depth.",
+                            risk_score=0.95,
+                        )
+                    )
+                if not delegation_context.scope_within_parent:
+                    matched_rules.append(
+                        MatchedRule(
+                            rule_id="RULE_DELEGATION_SCOPE_EXCEEDS_PARENT",
+                            decision=PolicyDecision.DENY,
+                            reason="Requested delegation authority exceeds parent grant envelope.",
+                            risk_score=1.0,
+                        )
+                    )
+                if not delegation_context.scope_within_root:
+                    matched_rules.append(
+                        MatchedRule(
+                            rule_id="RULE_DELEGATION_SCOPE_EXCEEDS_ROOT",
+                            decision=PolicyDecision.DENY,
+                            reason="Requested delegation authority exceeds root Intent Contract scope.",
+                            risk_score=1.0,
+                        )
+                    )
+                if (
+                    delegation_context.is_high_risk_delegation
+                    and delegation_context.caller_is_authorized_issuer
+                    and delegation_context.scope_within_root
+                    and delegation_context.scope_within_parent
+                    and delegation_context.depth_within_limits
+                    and delegation_context.cross_session_match
+                ):
+                    matched_rules.append(
+                        MatchedRule(
+                            rule_id="RULE_DELEGATION_REQUIRE_APPROVAL",
+                            decision=PolicyDecision.REQUIRE_APPROVAL,
+                            reason="Delegation grants high-risk or approval-required capabilities.",
+                            risk_score=0.7,
+                        )
+                    )
+
+            elif op == "EXECUTE_ACTION":
+                if not delegation_context.principal_matches_delegatee:
+                    matched_rules.append(
+                        MatchedRule(
+                            rule_id="RULE_DELEGATION_PRINCIPAL_MISMATCH",
+                            decision=PolicyDecision.DENY,
+                            reason="Authenticated caller principal does not match grant delegatee.",
+                            risk_score=1.0,
+                        )
+                    )
+                if delegation_context.effective_status == "REVOKED":
+                    matched_rules.append(
+                        MatchedRule(
+                            rule_id="RULE_DELEGATION_REVOKED",
+                            decision=PolicyDecision.DENY,
+                            reason="Delegation grant or an ancestor in its chain has been REVOKED.",
+                            risk_score=1.0,
+                        )
+                    )
+                elif delegation_context.effective_status == "CLOSED":
+                    matched_rules.append(
+                        MatchedRule(
+                            rule_id="RULE_DELEGATION_CLOSED",
+                            decision=PolicyDecision.DENY,
+                            reason="Delegation grant has been CLOSED upon completed task.",
+                            risk_score=0.95,
+                        )
+                    )
+                elif delegation_context.effective_status == "EXPIRED":
+                    matched_rules.append(
+                        MatchedRule(
+                            rule_id="RULE_DELEGATION_EXPIRED",
+                            decision=PolicyDecision.DENY,
+                            reason="Delegation grant TTL has expired.",
+                            risk_score=0.95,
+                        )
+                    )
+                elif delegation_context.effective_status == "CONSUMED":
+                    matched_rules.append(
+                        MatchedRule(
+                            rule_id="RULE_DELEGATION_BUDGET_EXHAUSTED",
+                            decision=PolicyDecision.DENY,
+                            reason="Delegation grant action execution budget has been exhausted.",
+                            risk_score=0.95,
+                        )
+                    )
+                elif delegation_context.effective_status == "ROOT_INVALID":
+                    matched_rules.append(
+                        MatchedRule(
+                            rule_id="RULE_DELEGATION_ROOT_INTENT_INVALID",
+                            decision=PolicyDecision.DENY,
+                            reason="Root Intent Contract is inactive, expired, or revoked.",
+                            risk_score=1.0,
+                        )
+                    )
+                elif delegation_context.effective_status == "ANCESTOR_INVALID":
+                    matched_rules.append(
+                        MatchedRule(
+                            rule_id="RULE_DELEGATION_INVALID_PARENT",
+                            decision=PolicyDecision.DENY,
+                            reason="An ancestor grant in the delegation hierarchy is expired, consumed, or invalid.",
+                            risk_score=1.0,
+                        )
+                    )
+
+                if not delegation_context.budget_available:
+                    matched_rules.append(
+                        MatchedRule(
+                            rule_id="RULE_DELEGATION_BUDGET_EXHAUSTED",
+                            decision=PolicyDecision.DENY,
+                            reason="Action budget on root intent or ancestor grant has been exhausted.",
+                            risk_score=0.95,
+                        )
+                    )
+                if not delegation_context.current_tool_within_effective_authority:
+                    matched_rules.append(
+                        MatchedRule(
+                            rule_id="RULE_DELEGATION_TOOL_NOT_AUTHORIZED",
+                            decision=PolicyDecision.DENY,
+                            reason="Requested tool is not authorized under live effective delegation authority.",
+                            risk_score=1.0,
+                        )
+                    )
+                if not delegation_context.current_resource_within_effective_authority:
+                    matched_rules.append(
+                        MatchedRule(
+                            rule_id="RULE_DELEGATION_RESOURCE_NOT_AUTHORIZED",
+                            decision=PolicyDecision.DENY,
+                            reason="Target resource is not authorized under live effective delegation scope.",
+                            risk_score=1.0,
+                        )
+                    )
+                if not delegation_context.current_environment_within_effective_authority:
+                    matched_rules.append(
+                        MatchedRule(
+                            rule_id="RULE_DELEGATION_ENVIRONMENT_NOT_AUTHORIZED",
+                            decision=PolicyDecision.DENY,
+                            reason="Target environment is not authorized under live effective delegation scope.",
+                            risk_score=1.0,
+                        )
+                    )
+                if not delegation_context.current_classification_within_effective_authority:
+                    matched_rules.append(
+                        MatchedRule(
+                            rule_id="RULE_DELEGATION_CLASSIFICATION_NOT_AUTHORIZED",
+                            decision=PolicyDecision.DENY,
+                            reason="Data classification exceeds live effective delegation limits.",
+                            risk_score=1.0,
+                        )
+                    )
+
+            elif op == "RESOLVE_APPROVAL":
+                appr = delegation_context.approval
+                if appr.approval_context_present:
+                    if not appr.approval_identity_match:
+                        matched_rules.append(
+                            MatchedRule(
+                                rule_id="RULE_DELEGATION_APPROVAL_IDENTITY_MISMATCH",
+                                decision=PolicyDecision.DENY,
+                                reason="Approver identity does not match designated approver for delegation checkpoint.",
+                                risk_score=1.0,
+                            )
+                        )
+                    if not appr.approval_revalidation_passed:
+                        matched_rules.append(
+                            MatchedRule(
+                                rule_id="RULE_DELEGATION_APPROVAL_STALE_AUTHORITY",
+                                decision=PolicyDecision.DENY,
+                                reason="Pre-execution revalidation failed; root intent or parent authority was modified or revoked.",
+                                risk_score=1.0,
+                            )
+                        )
+
+            elif op == "REVOKE_GRANT":
+                if not delegation_context.caller_is_authorized_to_revoke:
+                    matched_rules.append(
+                        MatchedRule(
+                            rule_id="RULE_DELEGATION_REVOCATION_NOT_AUTHORIZED",
+                            decision=PolicyDecision.DENY,
+                            reason="Caller is not authorized to revoke this delegation grant.",
+                            risk_score=1.0,
+                        )
+                    )
+
+            if delegation_context.analysis_status == "FAILED":
+                matched_rules.append(
+                    MatchedRule(
+                        rule_id="RULE_DELEGATION_ANALYSIS_FAILED",
+                        decision=PolicyDecision.DENY,
+                        reason="Delegation analysis failed or delegation invariants could not be verified.",
+                        risk_score=1.0,
+                    )
+                )
 
         # -------------------------------------------------------------
         # Rule D: Normal Low-Risk Baseline

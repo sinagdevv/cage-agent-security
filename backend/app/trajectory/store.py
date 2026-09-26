@@ -82,8 +82,21 @@ class TrajectoryStore:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._trajectories: dict[UUID, _InternalTrajectoryState] = {}
-        # Composite sovereign ownership key: (session_id, intent_id_str, agent_id) -> trajectory_id
+        # Composite sovereign ownership key: (session_id, intent_id, agent_id) -> trajectory_id
         self._ownership_index: dict[tuple[str, str, str], UUID] = {}
+
+    @staticmethod
+    def _make_key(
+        session_id: str | UUID,
+        intent_id: str | UUID,
+        agent_id: str | UUID,
+    ) -> tuple[str, str, str]:
+        """Canonical sovereign ownership key: (session_id, intent_id, agent_id).
+
+        agent_id is canonically str (e.g. 'agent-a', 'researcher-agent-1').
+        session_id and intent_id are normalized to str.
+        """
+        return (str(session_id), str(intent_id), str(agent_id))
 
     def get_snapshot(self, trajectory_id: UUID) -> TrajectorySnapshot | None:
         """Retrieve an immutable snapshot of the given trajectory."""
@@ -94,10 +107,10 @@ class TrajectoryStore:
             return state.to_snapshot()
 
     def get_active_trajectory_id(
-        self, session_id: str, intent_id: UUID, agent_id: str
+        self, session_id: str | UUID, intent_id: UUID | str, agent_id: str | UUID
     ) -> UUID | None:
         """Lookup active trajectory ID by authoritative ownership tuple."""
-        key = (session_id, str(intent_id), agent_id)
+        key = self._make_key(session_id, intent_id, agent_id)
         with self._lock:
             traj_id = self._ownership_index.get(key)
             if traj_id is None:
@@ -107,12 +120,20 @@ class TrajectoryStore:
                 return traj_id
             return None
 
+    def get_trajectory_id(
+        self, session_id: str | UUID, intent_id: UUID | str, agent_id: str | UUID
+    ) -> UUID | None:
+        """Lookup trajectory ID by authoritative ownership tuple (any status)."""
+        key = self._make_key(session_id, intent_id, agent_id)
+        with self._lock:
+            return self._ownership_index.get(key)
+
     def create_trajectory(
         self,
-        session_id: str,
-        intent_id: UUID,
+        session_id: str | UUID,
+        intent_id: UUID | str,
         initial_authority: AuthorityEnvelope | None = None,
-        agent_id: str = "test-agent",
+        agent_id: str | UUID = "test-agent",
     ) -> UUID:
         """Explicitly create and register a new trajectory instance."""
         with self._lock:
@@ -121,9 +142,9 @@ class TrajectoryStore:
             auth = initial_authority or AuthorityEnvelope(allowed_tools=frozenset())
             state = _InternalTrajectoryState(
                 trajectory_id=traj_id,
-                session_id=session_id,
-                intent_id=intent_id,
-                agent_id=agent_id,
+                session_id=str(session_id),
+                intent_id=UUID(str(intent_id)) if not isinstance(intent_id, UUID) else intent_id,
+                agent_id=str(agent_id),
                 status=TrajectoryStatus.ACTIVE,
                 created_at=now,
                 updated_at=now,
@@ -131,7 +152,7 @@ class TrajectoryStore:
                 effective_authority=auth,
             )
             self._trajectories[traj_id] = state
-            key = (session_id, str(intent_id), agent_id)
+            key = self._make_key(session_id, intent_id, agent_id)
             self._ownership_index[key] = traj_id
             return traj_id
 
@@ -178,13 +199,16 @@ class TrajectoryStore:
             state.updated_at = datetime.now(UTC)
             return state.to_snapshot()
 
-    def get_or_create_trajectory(self, intent: IntentContract) -> tuple[TrajectorySnapshot, bool]:
-        """Get existing active trajectory or create a fresh one for the Intent Contract.
+    def get_or_create_trajectory(
+        self, intent: IntentContract, agent_id: str | UUID | None = None
+    ) -> tuple[TrajectorySnapshot, bool]:
+        """Get existing active trajectory or create a fresh one for the Intent Contract and agent.
 
         If a prior trajectory under this Intent was QUARANTINED or ABORTED,
         creation of a new trajectory is blocked to prevent quarantine escape.
         """
-        key = (intent.session_id, str(intent.intent_id), intent.agent_id)
+        effective_agent = str(agent_id or intent.agent_id)
+        key = self._make_key(intent.session_id, intent.intent_id, effective_agent)
         with self._lock:
             existing_id = self._ownership_index.get(key)
             if existing_id is not None:
@@ -209,7 +233,7 @@ class TrajectoryStore:
                 trajectory_id=traj_id,
                 session_id=intent.session_id,
                 intent_id=intent.intent_id,
-                agent_id=intent.agent_id,
+                agent_id=effective_agent,
                 status=TrajectoryStatus.ACTIVE,
                 created_at=now,
                 updated_at=now,

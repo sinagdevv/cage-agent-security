@@ -69,11 +69,11 @@ def test_policy_input_normalization_and_server_control() -> None:
 
     # Verify server-controlled schema version
     assert policy_input.schema_version == POLICY_INPUT_SCHEMA_VERSION
-    assert policy_input.schema_version == "cage-policy-input-v4"
+    assert policy_input.schema_version == "cage-policy-input-v5"
 
     # Verify policy version and schema version remain distinct concepts
     assert POLICY_VERSION != POLICY_INPUT_SCHEMA_VERSION
-    assert POLICY_VERSION == "phase6-v1"
+    assert POLICY_VERSION == "phase8-v1"
 
     # Verify normalized contexts
     assert policy_input.action.tool_name == "db.query"

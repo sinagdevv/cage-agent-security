@@ -43,6 +43,10 @@ class ProvenanceCycleError(ValueError):
     """Raised when an artifact derivation edge would create a cycle in the provenance graph."""
 
 
+class DelegationCycleError(ValueError):
+    """Raised when a subdelegation edge would create a cycle in the delegation hierarchy."""
+
+
 class CausalExecutionGraph:
     """Foundational graph structure for tracking causal agent trajectories."""
 
@@ -55,6 +59,10 @@ class CausalExecutionGraph:
     def graph(self) -> nx.DiGraph:
         """Access underlying NetworkX DiGraph instance."""
         return self._graph
+
+    def has_node(self, node_id: str) -> bool:
+        """Check if a node ID exists in the graph."""
+        return self._graph.has_node(node_id)
 
     def add_node(
         self,
@@ -75,9 +83,15 @@ class CausalExecutionGraph:
     ) -> None:
         """Add a directed causal relation between two nodes with cycle prevention."""
         rel_str = relation.value if isinstance(relation, GraphRelation) else str(relation)
-        if rel_str == GraphRelation.CAUSES.value or rel_str == "causes":
-            if self._graph.has_node(target_id) and self._graph.has_node(source_id):
-                if nx.has_path(self._graph, target_id, source_id):
+        if rel_str in (GraphRelation.CAUSES.value, "causes"):
+            causes_graph = nx.subgraph_view(
+                self._graph,
+                filter_edge=lambda u, v: (
+                    self._graph[u][v].get("relation") in (GraphRelation.CAUSES.value, "causes")
+                ),
+            )
+            if causes_graph.has_node(target_id) and causes_graph.has_node(source_id):
+                if nx.has_path(causes_graph, target_id, source_id):
                     raise GraphCycleError(
                         f"Causal cycle detected: adding causal edge from '{source_id}' to '{target_id}' "
                         f"would create a directed cycle in session '{self.session_id}'."
@@ -111,6 +125,122 @@ class CausalExecutionGraph:
         if not self._graph.has_node(action_id):
             raise KeyError(f"Action node '{action_id}' does not exist in session graph.")
         self._graph.add_edge(intent_id, action_id, relation=GraphRelation.GOVERNS.value)
+
+    def add_agent_node(
+        self,
+        agent_id: str,
+        is_control_plane: bool = False,
+        session_id: str | None = None,
+    ) -> None:
+        """Record an Agent identity node in the causal graph."""
+        if not self._graph.has_node(agent_id):
+            self._graph.add_node(
+                agent_id,
+                node_type=GraphNodeType.AGENT.value,
+                agent_id=agent_id,
+                is_control_plane=is_control_plane,
+                session_id=session_id or self.session_id,
+                created_at=datetime.now(UTC).isoformat(),
+            )
+
+    def add_delegation_node(self, grant: Any) -> None:
+        """Record a DelegationGrant node in the causal graph."""
+        del_id = str(grant.delegation_id)
+        if not self._graph.has_node(del_id):
+            self._graph.add_node(
+                del_id,
+                node_type=GraphNodeType.DELEGATION.value,
+                delegation_id=del_id,
+                parent_delegation_id=str(grant.parent_delegation_id)
+                if grant.parent_delegation_id
+                else None,
+                root_intent_id=str(grant.root_intent_id),
+                session_id=str(grant.session_id),
+                delegator_agent_id=grant.delegator_agent_id,
+                delegatee_agent_id=grant.delegatee_agent_id,
+                delegated_task_id=grant.delegated_task_id,
+                depth=grant.depth,
+                remaining_subdelegation_depth=grant.remaining_subdelegation_depth,
+                allow_subdelegation=grant.allow_subdelegation,
+                max_actions=grant.max_actions,
+                created_at=grant.created_at.isoformat()
+                if hasattr(grant.created_at, "isoformat")
+                else str(grant.created_at),
+                expires_at=grant.expires_at.isoformat()
+                if hasattr(grant.expires_at, "isoformat")
+                else str(grant.expires_at),
+            )
+
+    def add_issues_delegation_edge(self, agent_id: str, delegation_id: str) -> None:
+        """Record that an agent issued a delegation: Agent --ISSUES_DELEGATION--> Delegation."""
+        if not self._graph.has_node(agent_id):
+            self.add_agent_node(agent_id)
+        if not self._graph.has_node(delegation_id):
+            raise KeyError(f"Delegation node '{delegation_id}' does not exist.")
+        self._graph.add_edge(
+            agent_id, delegation_id, relation=GraphRelation.ISSUES_DELEGATION.value
+        )
+
+    def add_grants_to_edge(self, delegation_id: str, agent_id: str) -> None:
+        """Record that a grant authorizes a recipient: Delegation --GRANTS_TO--> Agent."""
+        if not self._graph.has_node(delegation_id):
+            raise KeyError(f"Delegation node '{delegation_id}' does not exist.")
+        if not self._graph.has_node(agent_id):
+            self.add_agent_node(agent_id)
+        self._graph.add_edge(delegation_id, agent_id, relation=GraphRelation.GRANTS_TO.value)
+
+    def add_subdelegates_edge(self, parent_delegation_id: str, child_delegation_id: str) -> None:
+        """Record parent-to-child subdelegation with strict cycle rejection."""
+        if not self._graph.has_node(parent_delegation_id):
+            raise KeyError(f"Parent delegation node '{parent_delegation_id}' does not exist.")
+        if not self._graph.has_node(child_delegation_id):
+            raise KeyError(f"Child delegation node '{child_delegation_id}' does not exist.")
+
+        subdel_graph = nx.subgraph_view(
+            self._graph,
+            filter_edge=lambda u, v: (
+                self._graph[u][v].get("relation") == GraphRelation.SUBDELEGATES.value
+            ),
+        )
+        if subdel_graph.has_node(child_delegation_id) and subdel_graph.has_node(
+            parent_delegation_id
+        ):
+            if nx.has_path(subdel_graph, child_delegation_id, parent_delegation_id):
+                raise DelegationCycleError(
+                    f"Delegation cycle detected: adding subdelegates edge from '{parent_delegation_id}' "
+                    f"to '{child_delegation_id}' would create a cycle in session '{self.session_id}'."
+                )
+        self._graph.add_edge(
+            parent_delegation_id,
+            child_delegation_id,
+            relation=GraphRelation.SUBDELEGATES.value,
+        )
+
+    def add_creates_delegation_edge(self, action_id: str, delegation_id: str) -> None:
+        """Record action-to-grant creation correlation: Action --CREATES_DELEGATION--> Delegation."""
+        if not self._graph.has_node(action_id):
+            raise KeyError(f"Action node '{action_id}' does not exist.")
+        if not self._graph.has_node(delegation_id):
+            raise KeyError(f"Delegation node '{delegation_id}' does not exist.")
+        self._graph.add_edge(
+            action_id, delegation_id, relation=GraphRelation.CREATES_DELEGATION.value
+        )
+
+    def add_delegation_governs_edge(self, delegation_id: str, action_id: str) -> None:
+        """Record delegation-level governance: Delegation --GOVERNS--> Action."""
+        if not self._graph.has_node(delegation_id):
+            raise KeyError(f"Delegation node '{delegation_id}' does not exist.")
+        if not self._graph.has_node(action_id):
+            raise KeyError(f"Action node '{action_id}' does not exist.")
+        self._graph.add_edge(delegation_id, action_id, relation=GraphRelation.GOVERNS.value)
+
+    def add_intent_delegation_governs_edge(self, intent_id: str, delegation_id: str) -> None:
+        """Record root intent governance over delegation: Intent --GOVERNS--> Delegation."""
+        if not self._graph.has_node(intent_id):
+            raise KeyError(f"Intent node '{intent_id}' does not exist.")
+        if not self._graph.has_node(delegation_id):
+            raise KeyError(f"Delegation node '{delegation_id}' does not exist.")
+        self._graph.add_edge(intent_id, delegation_id, relation=GraphRelation.GOVERNS.value)
 
     def add_artifact_node(self, artifact: Any) -> None:
         """Record an InformationArtifact as an authoritative data provenance node.
@@ -536,15 +666,30 @@ class CausalExecutionGraph:
         )
         return nx.is_directed_acyclic_graph(derived_graph)
 
+    def is_subdelegation_dag(self) -> bool:
+        """Check if the subdelegation lineage subgraph (SUBDELEGATES edges) is an acyclic DAG."""
+        subdel_graph = nx.subgraph_view(
+            self._graph,
+            filter_edge=lambda u, v: (
+                self._graph[u][v].get("relation") == GraphRelation.SUBDELEGATES.value
+            ),
+        )
+        return nx.is_directed_acyclic_graph(subdel_graph)
+
     def has_valid_typed_dags(self) -> bool:
         """Check that all relation-specific typed subgraphs satisfy DAG invariants.
 
         Specifically:
         1. Action causality subgraph (CAUSES edges) must be a DAG.
         2. Artifact derivation lineage subgraph (DERIVED_FROM edges) must be a DAG.
+        3. Delegation hierarchy subgraph (SUBDELEGATES edges) must be a DAG.
         Note: The full heterogeneous graph is NOT required to be acyclic across different relation types.
         """
-        return self.is_action_causality_dag() and self.is_artifact_lineage_dag()
+        return (
+            self.is_action_causality_dag()
+            and self.is_artifact_lineage_dag()
+            and self.is_subdelegation_dag()
+        )
 
     def is_dag(self) -> bool:
         """Check action causality DAG integrity (action causality subgraph).

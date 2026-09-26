@@ -245,6 +245,8 @@ class GraphNodeType(StrEnum):
     INTENT = "intent"
     ACTION = "action"
     ARTIFACT = "artifact"
+    AGENT = "agent"
+    DELEGATION = "delegation"
 
 
 class GraphRelation(StrEnum):
@@ -255,6 +257,10 @@ class GraphRelation(StrEnum):
     PRODUCES = "produces"
     CONSUMES = "consumes"
     DERIVED_FROM = "derived_from"
+    ISSUES_DELEGATION = "issues_delegation"
+    GRANTS_TO = "grants_to"
+    SUBDELEGATES = "subdelegates"
+    CREATES_DELEGATION = "creates_delegation"
 
 
 class GraphAnalysisStatus(StrEnum):
@@ -302,3 +308,47 @@ class AuthorityViolationType(StrEnum):
     RESOURCE = "RESOURCE"
     ENVIRONMENT = "ENVIRONMENT"
     DATA_CLASSIFICATION = "DATA_CLASSIFICATION"
+
+
+class DelegationStatus(StrEnum):
+    """Stored lifecycle state of a DelegationGrant."""
+
+    ACTIVE = "ACTIVE"
+    REVOKED = "REVOKED"
+    CLOSED = "CLOSED"
+
+
+class EffectiveDelegationStatus(StrEnum):
+    """Derived live authorization state of a DelegationGrant."""
+
+    ACTIVE = "ACTIVE"
+    REVOKED = "REVOKED"
+    CLOSED = "CLOSED"
+    EXPIRED = "EXPIRED"
+    CONSUMED = "CONSUMED"
+    ROOT_INVALID = "ROOT_INVALID"
+    ANCESTOR_INVALID = "ANCESTOR_INVALID"
+
+
+class DelegationIssuanceSource(StrEnum):
+    """Source of delegation issuance."""
+
+    AGENT_DIRECT = "AGENT_DIRECT"
+    CONTROL_PLANE_MEDIATED = "CONTROL_PLANE_MEDIATED"
+
+
+class DelegationOperation(StrEnum):
+    """Specific operational context for delegation policy evaluation."""
+
+    NONE = "NONE"
+    CREATE_GRANT = "CREATE_GRANT"
+    EXECUTE_ACTION = "EXECUTE_ACTION"
+    RESOLVE_APPROVAL = "RESOLVE_APPROVAL"
+    REVOKE_GRANT = "REVOKE_GRANT"
+
+
+class DelegationAnalysisStatus(StrEnum):
+    """Execution status of delegation security analysis."""
+
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"

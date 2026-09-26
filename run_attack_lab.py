@@ -4,14 +4,19 @@ Executes all deterministic Phase 7 attack and benign scenarios against the real 
 verifies security invariants, and generates JSON and Markdown evaluation reports.
 """
 
+import argparse
+import os
 import sys
 from pathlib import Path
+
+import httpx
 
 # Add backend to sys.path for app module imports
 backend_dir = Path(__file__).resolve().parent / "backend"
 if str(backend_dir) not in sys.path:
     sys.path.insert(0, str(backend_dir))
 
+from app.core.config import settings  # noqa: E402
 from app.schemas.enums import PolicyBackend  # noqa: E402
 from attack_lab.reporting import (  # noqa: E402
     generate_attack_metrics,
@@ -22,14 +27,41 @@ from attack_lab.runner import AttackScenarioRunner  # noqa: E402
 from attack_lab.scenarios import get_all_scenarios  # noqa: E402
 
 
+def _detect_backend(requested: str | None) -> PolicyBackend:
+    if requested:
+        return PolicyBackend(requested)
+    env_backend = os.getenv("POLICY_BACKEND")
+    if env_backend:
+        return PolicyBackend(env_backend)
+    # Check if OPA daemon is reachable
+    try:
+        resp = httpx.get(f"{settings.opa_url.rstrip('/')}/v1/data", timeout=0.5)
+        if resp.status_code == 200:
+            return PolicyBackend.SHADOW
+    except Exception:
+        pass
+    print(f"[*] Live OPA daemon not reachable at {settings.opa_url}; using PolicyBackend.PYTHON.")
+    return PolicyBackend.PYTHON
+
+
 def main():
+    parser = argparse.ArgumentParser(description="CAGE Attack Simulation Lab CLI")
+    parser.add_argument(
+        "--backend",
+        choices=["python", "opa", "shadow"],
+        default=None,
+        help="Policy backend to evaluate (default: auto-detect OPA -> shadow, fallback python)",
+    )
+    args = parser.parse_args()
+    backend = _detect_backend(args.backend)
+
     print("=" * 80)
     print("CAGE PHASE 7: ATTACK SIMULATION LAB")
     print("Deterministic Adversarial Evaluation and Governance Invariant Verification")
+    print(f"Policy Backend: {backend.value}")
     print("=" * 80)
 
-    # Initialize Runner with Shadow Policy Backend (Python + live OPA parity check)
-    runner = AttackScenarioRunner(policy_backend=PolicyBackend.SHADOW)
+    runner = AttackScenarioRunner(policy_backend=backend)
     scenarios = get_all_scenarios()
     print(f"\n[+] Loaded {len(scenarios)} deterministic scenarios across Categories A-T.")
     print("[+] Executing scenarios through isolated real CAGE AgentGateway instances...\n")

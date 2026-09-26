@@ -22,6 +22,7 @@ is_destructive {
 
 # Unknown Tool Privileged Access Guard
 findings[f] {
+    input.action.action_type != "DELEGATION"
     input.tool.known == false
     requires_privilege_check
     f := {

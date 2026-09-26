@@ -1,6 +1,7 @@
 """Agent Gateway service coordinating action ingestion, graph recording, intent validation, and policy evaluation."""
 
 import logging
+from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
 from app.gateway.registry import ToolRegistry, default_tool_registry
@@ -14,7 +15,11 @@ from app.graph.causal_graph import (
 )
 from app.intent.service import IntentService, default_intent_service
 from app.policies.engine import PolicyEngine, default_policy_engine
-from app.policies.policy_input import build_cage_policy_input
+
+if TYPE_CHECKING:
+    from app.delegation.service import DelegationService
+from app.identity.principal import AgentPrincipal, PrincipalAuthenticationSource
+from app.policies.policy_input import build_cage_policy_input, build_delegated_action_context
 from app.policies.rules import DeterministicPolicyEvaluator
 from app.provenance.analyzer import ProvenanceAnalyzer, default_provenance_analyzer
 from app.provenance.factory import ArtifactFactory, default_artifact_factory
@@ -34,6 +39,7 @@ from app.schemas.enums import (
     ToolExecutionStatus,
     TrajectoryStatus,
 )
+from app.schemas.policy import PolicyDelegationContext
 from app.trajectory.analyzer import TrajectoryAnalyzer, default_trajectory_analyzer
 from app.trajectory.models import ControlPlaneAuthContext
 from app.trajectory.store import TrajectoryStore, default_trajectory_store
@@ -63,6 +69,7 @@ class AgentGateway:
         resource_registry: ResourceSecurityProfileRegistry | None = None,
         trajectory_store: TrajectoryStore | None = None,
         trajectory_analyzer: TrajectoryAnalyzer | None = None,
+        delegation_service: DelegationService | None = None,
         require_intent: bool = True,
     ) -> None:
         self.graph_manager = graph_manager or default_session_graph_manager
@@ -88,6 +95,12 @@ class AgentGateway:
             else default_trajectory_store
         )
         self.trajectory_analyzer = trajectory_analyzer or default_trajectory_analyzer
+        if delegation_service is not None:
+            self.delegation_service = delegation_service
+        else:
+            from app.delegation.service import default_delegation_service
+
+            self.delegation_service = default_delegation_service
         self.require_intent = require_intent
 
         if policy_engine is not None:
@@ -103,7 +116,9 @@ class AgentGateway:
             self.policy_evaluator = default_policy_engine.python_evaluator
 
     def evaluate_proposal(
-        self, proposal: AgentActionProposal
+        self,
+        proposal: AgentActionProposal,
+        principal: AgentPrincipal | None = None,
     ) -> tuple[AgentAction, SecurityDecision]:
         """Ingest, validate, record in causal graph, and evaluate an AgentActionProposal.
 
@@ -170,7 +185,9 @@ class AgentGateway:
         trajectory_id: UUID | None = None
 
         if contract is not None:
-            trajectory_snapshot, _ = self.trajectory_store.get_or_create_trajectory(contract)
+            trajectory_snapshot, _ = self.trajectory_store.get_or_create_trajectory(
+                contract, agent_id=proposal.agent_id
+            )
             trajectory_id = trajectory_snapshot.trajectory_id
 
             # Check if pending approval is blocking the trajectory
@@ -235,7 +252,7 @@ class AgentGateway:
         if (
             contract is not None
             and contract.session_id == session_id
-            and contract.agent_id == proposal.agent_id
+            and (contract.agent_id == proposal.agent_id or proposal.delegation_id is not None)
             and not intent_mismatch
         ):
             action.intent_contract_id = contract.intent_id
@@ -351,6 +368,57 @@ class AgentGateway:
                 bound_outbound_artifacts=bound_sensitive_artifacts,
             )
 
+        # 9b. Derive authoritative delegation security context (Phase 8)
+        delegation_context = PolicyDelegationContext(operation="NONE", is_delegated=False)
+        resolved_delegation_id = None
+        if proposal.delegation_id is not None:
+            grant = self.delegation_service.get_delegation_grant(proposal.delegation_id)
+            if (
+                grant is not None
+                and str(grant.session_id) == str(session_id)
+                and contract is not None
+                and grant.root_intent_id == contract.intent_id
+            ):
+                grants, states = self.delegation_service.store.get_chain_with_states(
+                    proposal.delegation_id
+                )
+                target_grant = grants[-1]
+                target_state = states[-1]
+                ancestor_grants = grants[:-1]
+                ancestor_states = states[:-1]
+                effective_principal = principal
+                if effective_principal is None:
+                    effective_principal = AgentPrincipal(
+                        agent_id=proposal.agent_id,
+                        session_id=UUID(str(session_id)),
+                        authentication_source=PrincipalAuthenticationSource.HOSTING_RUNTIME,
+                    )
+                delegation_context = build_delegated_action_context(
+                    action=action,
+                    principal=effective_principal,
+                    grant=target_grant,
+                    runtime_state=target_state,
+                    root_intent=contract,
+                    ancestors=ancestor_grants,
+                    ancestor_states=ancestor_states,
+                    analyzer=self.delegation_service.analyzer,
+                )
+                resolved_delegation_id = target_grant.delegation_id
+                graph.add_delegation_governs_edge(str(target_grant.delegation_id), action_key)
+            else:
+                delegation_context = PolicyDelegationContext(
+                    operation="EXECUTE_ACTION",
+                    is_delegated=True,
+                    effective_status="REVOKED",
+                    principal_matches_delegatee=False,
+                )
+                if contract is not None and proposal.agent_id != contract.agent_id:
+                    intent_mismatch = True
+        elif contract is not None and proposal.agent_id != contract.agent_id:
+            intent_mismatch = True
+
+        action.delegation_id = resolved_delegation_id
+
         # 10. Build single canonical CagePolicyInput document
         policy_input = build_cage_policy_input(
             action=action,
@@ -361,6 +429,7 @@ class AgentGateway:
             graph_context=graph_context,
             provenance_context=provenance_context,
             trajectory_context=trajectory_context,
+            delegation_context=delegation_context,
         )
 
         # 11. Policy evaluation (Unified Python / OPA via PolicyEngine)
@@ -389,22 +458,41 @@ class AgentGateway:
                 self.trajectory_store.mark_quarantined(trajectory_snapshot.trajectory_id)
 
         # 13. Atomic Tool Execution Budget Reservation
-        if decision.decision == PolicyDecision.ALLOW and contract is not None:
-            reserved = self.intent_service.reserve_tool_execution(contract.intent_id)
-            if not reserved:
-                decision = SecurityDecision(
-                    action_id=action.action_id,
-                    session_id=action.session_id,
-                    intent_contract_id=contract.intent_id,
-                    decision=PolicyDecision.DENY,
-                    reason=f"Tool call budget exceeded: {contract.tool_calls_count}/{contract.maximum_tool_calls} executions consumed.",
-                    matched_rules=decision.matched_rules + ["RULE_TOOL_BUDGET_EXCEEDED"],
-                    risk_score=0.85,
-                    requires_human_approval=False,
-                    policy_backend=decision.policy_backend,
-                    policy_version=decision.policy_version,
-                    policy_input_schema_version=decision.policy_input_schema_version,
+        if decision.decision == PolicyDecision.ALLOW:
+            if action.delegation_id is not None:
+                delegation_reserved = self.delegation_service.store.reserve_action_dispatch(
+                    action.delegation_id
                 )
+                if not delegation_reserved:
+                    decision = SecurityDecision(
+                        action_id=action.action_id,
+                        session_id=action.session_id,
+                        intent_contract_id=contract.intent_id if contract else None,
+                        decision=PolicyDecision.DENY,
+                        reason="Action budget on root intent or ancestor grant has been exhausted.",
+                        matched_rules=decision.matched_rules + ["RULE_DELEGATION_BUDGET_EXHAUSTED"],
+                        risk_score=0.95,
+                        requires_human_approval=False,
+                        policy_backend=decision.policy_backend,
+                        policy_version=decision.policy_version,
+                        policy_input_schema_version=decision.policy_input_schema_version,
+                    )
+            if decision.decision == PolicyDecision.ALLOW and contract is not None:
+                reserved = self.intent_service.reserve_tool_execution(contract.intent_id)
+                if not reserved:
+                    decision = SecurityDecision(
+                        action_id=action.action_id,
+                        session_id=action.session_id,
+                        intent_contract_id=contract.intent_id,
+                        decision=PolicyDecision.DENY,
+                        reason=f"Tool call budget exceeded: {contract.tool_calls_count}/{contract.maximum_tool_calls} executions consumed.",
+                        matched_rules=decision.matched_rules + ["RULE_TOOL_BUDGET_EXCEEDED"],
+                        risk_score=0.85,
+                        requires_human_approval=False,
+                        policy_backend=decision.policy_backend,
+                        policy_version=decision.policy_version,
+                        policy_input_schema_version=decision.policy_input_schema_version,
+                    )
 
         # 14. Map verdict to execution status
         if decision.decision == PolicyDecision.ALLOW:
@@ -724,6 +812,24 @@ class AgentGateway:
             matched_rules=action.matched_rules,
             risk_score=action.risk_score,
             requires_human_approval=False,
+        )
+
+        # Blocker 10: Deterministic assertion that no security-store lock is held during tool execution
+        def _is_locked_or_owned(lk: Any) -> bool:
+            if hasattr(lk, "_is_owned"):
+                return bool(lk._is_owned())
+            if hasattr(lk, "locked"):
+                return bool(lk.locked())
+            return False
+
+        assert not _is_locked_or_owned(self.delegation_service.store._lock), (
+            "DelegationStore lock held during tool execution"
+        )
+        assert not _is_locked_or_owned(self.trajectory_store._lock), (
+            "TrajectoryStore lock held during tool execution"
+        )
+        assert not _is_locked_or_owned(self.intent_service._lock), (
+            "IntentService lock held during tool execution"
         )
 
         try:

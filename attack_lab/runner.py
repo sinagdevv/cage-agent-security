@@ -3,12 +3,17 @@
 import time
 from uuid import UUID, uuid4
 
+from app.delegation.analyzer import DelegationAnalyzer
+from app.delegation.models import DelegationProposal, ResourceAuthorityScopeRequest
+from app.delegation.service import DelegationService
+from app.delegation.store import DelegationStore
 from app.gateway.service import AgentGateway
 from app.graph.causal_graph import (
     CrossSessionParentError,
     ParentActionNotFoundError,
     SessionGraphManager,
 )
+from app.identity.principal import AgentPrincipal, PrincipalAuthenticationSource
 from app.intent.service import IntentService
 from app.policies.engine import PolicyEngine
 from app.policies.rules import DeterministicPolicyEvaluator
@@ -17,6 +22,7 @@ from app.provenance.factory import ArtifactFactory
 from app.provenance.store import ArtifactPayloadStore, ProvenanceStore
 from app.schemas.action import AgentActionProposal
 from app.schemas.enums import (
+    AuthorityScopeMode,
     DataClassification,
     PolicyBackend,
     PolicyDecision,
@@ -77,6 +83,16 @@ class AttackScenarioRunner:
         evaluator = DeterministicPolicyEvaluator(tool_registry=tool_registry)
         engine = PolicyEngine(python_evaluator=evaluator, backend=self.policy_backend)
 
+        delegation_store = DelegationStore()
+        delegation_analyzer = DelegationAnalyzer()
+        delegation_service = DelegationService(
+            store=delegation_store,
+            intent_service=intent_service,
+            evaluator=evaluator,
+            graph_manager=graph_manager,
+            analyzer=delegation_analyzer,
+        )
+
         gateway = AgentGateway(
             graph_manager=graph_manager,
             policy_engine=engine,
@@ -89,6 +105,7 @@ class AttackScenarioRunner:
             resource_registry=resource_registry,
             trajectory_store=traj_store,
             trajectory_analyzer=traj_analyzer,
+            delegation_service=delegation_service,
             require_intent=True,
         )
 
@@ -130,6 +147,7 @@ class AttackScenarioRunner:
 
         # 5. Execute steps sequentially
         step_map: dict[str, UUID] = {}
+        delegation_map: dict[str, UUID] = {}
         step_results: list[StepResult] = []
         last_action_id: UUID | None = None
         bypass_detected = False
@@ -152,128 +170,388 @@ class AttackScenarioRunner:
             approval_attempted = False
             approval_succeeded: bool | None = None
 
-            # Resolve Parent Action ID
-            parent_id: UUID | None = None
-            if step.omit_parent:
-                parent_id = None
-            elif step.explicit_parent_action_id is not None:
-                parent_id = step.explicit_parent_action_id
-            elif step.parent_step_id is not None:
-                parent_id = step_map.get(step.parent_step_id)
-            else:
-                parent_id = last_action_id
-
-            # Resolve Input Artifacts & Payload Bindings
-            input_artifact_ids: list[UUID] = []
-            for k in step.input_artifact_keys:
-                if k in artifact_map:
-                    input_artifact_ids.append(artifact_map[k])
-
-            tool_args = dict(step.tool_arguments)
-            for param, art_key in step.payload_bindings.items():
-                if param == "destination_path":
-                    if "destination" not in tool_args:
-                        tool_args["destination"] = f"https://example.com{art_key}"
-                elif param in ("body", "data", "payload", "content", "token"):
-                    art_id = artifact_map.get(art_key)
-                    if art_id:
-                        tool_args[f"{param}_artifact_id"] = str(art_id)
-                        tool_args["body_artifact_id"] = str(art_id)
-                    else:
-                        tool_args[f"{param}_artifact_id"] = str(art_key)
-                        tool_args["body_artifact_id"] = str(art_key)
-                else:
-                    tool_args[param] = art_key
-
-            input_trust = step.metadata.get("trust_level", TrustLevel.MEDIUM)
-            if not isinstance(input_trust, TrustLevel):
-                try:
-                    input_trust = TrustLevel(str(input_trust))
-                except ValueError:
-                    input_trust = TrustLevel.MEDIUM
-
-            proposal = AgentActionProposal(
-                session_id=str(session_id),
-                agent_id=str(agent_id),
-                tool_name=step.tool_name,
-                action_type=step.action_type,
-                target_resource=step.resource_id,
-                target_environment=step.environment,
-                parent_action_id=parent_id,
-                input_artifact_ids=input_artifact_ids,
-                tool_arguments=tool_args,
-                input_trust_level=input_trust,
-                client_action_id=str(step.client_action_id) if step.client_action_id else None,
+            current_agent_id = str(step.agent_id) if step.agent_id else str(agent_id)
+            principal = AgentPrincipal(
+                agent_id=current_agent_id,
+                session_id=session_id,
+                authentication_source=PrincipalAuthenticationSource.TEST_FIXTURE,
+                is_control_plane=bool(step.metadata.get("is_control_plane", False)),
             )
 
-            # Process Proposal through Real Gateway
-            try:
-                action, decision = gateway.evaluate_proposal(proposal)
-                action_id = action.action_id
-                step_map[step.step_id] = action_id
-                last_action_id = action_id
-                evidence_actions.append(action_id)
-
-                actual_decision = decision.decision
-                actual_rules = list(decision.matched_rules)
-
-                # If tool was authorized, execute through gateway
-                if actual_decision == PolicyDecision.ALLOW:
-                    tool_result = gateway.execute_authorized_action(action.action_id)
-                    if tool_result is not None:
-                        tool_dispatched = True
-
-                # Check if simulated side effects were recorded
-                if any(c["action_id"] == action_id for c in mock_recorder.side_effects):
-                    side_effect = True
-
-                # Handle Step Approval Flow if requested
-                approval_attempted = False
-                approval_succeeded = None
-                if actual_decision == PolicyDecision.REQUIRE_APPROVAL and step.request_approval:
-                    approval_attempted = True
-                    # Apply intent mutation before approval if specified (for TOCTOU testing)
-                    if step.mutate_intent_before_approval:
-                        narrow_req = step.mutate_intent_before_approval
-                        if "status" in narrow_req and narrow_req["status"] == "REVOKED":
-                            intent_service.revoke_intent(intent.intent_id)
-                        elif "tools" in narrow_req:
-                            intent_service.narrow_intent(
-                                IntentContractNarrow(
-                                    intent_id=intent.intent_id,
-                                    allowed_tools=narrow_req["tools"],
-                                    allowed_resources=narrow_req.get("resources"),
-                                    allowed_environments=narrow_req.get("environments"),
-                                    allowed_data_classifications=narrow_req.get("classifications"),
-                                )
-                            )
-
-                    # Execute approval through Gateway
-                    try:
-                        appr_action, appr_res = gateway.resolve_pending_approval(
-                            action_id=action_id,
-                            approved=True,
+            # Check if this step is for direct delegation revocation / close
+            if step.metadata.get("revoke_delegation_key"):
+                rev_del_id = delegation_map.get(step.metadata["revoke_delegation_key"])
+                if rev_del_id:
+                    rev_principal = principal
+                    if not step.metadata.get("revoke_as_caller", False):
+                        # Default to authoritative root Intent owner / control plane for out-of-band revocation
+                        rev_principal = AgentPrincipal(
+                            agent_id=str(agent_id),
+                            session_id=session_id,
+                            authentication_source=PrincipalAuthenticationSource.TEST_FIXTURE,
+                            is_control_plane=True,
                         )
-                        if appr_res is not None and appr_res.get("success"):
-                            tool_dispatched = True
-                            approval_succeeded = True
-                        else:
-                            approval_succeeded = False
-                        if any(c["action_id"] == action_id for c in mock_recorder.side_effects):
-                            side_effect = True
-                    except (ValueError, PermissionError) as ae:
-                        approval_succeeded = False
-                        notes.append(f"Approval for {step.step_id} rejected: {ae}")
+                    try:
+                        delegation_service.revoke_delegation(
+                            delegation_id=rev_del_id,
+                            principal=rev_principal,
+                            reason="Revoked during scenario",
+                        )
+                    except Exception as e:
+                        notes.append(f"Revocation error: {e}")
+            elif step.metadata.get("close_delegation_key"):
+                cls_del_id = delegation_map.get(step.metadata["close_delegation_key"])
+                if cls_del_id:
+                    grant_obj = delegation_store.get_grant(cls_del_id)
+                    cls_agent_id = grant_obj.delegatee_agent_id if grant_obj else current_agent_id
+                    cls_principal = AgentPrincipal(
+                        agent_id=cls_agent_id,
+                        session_id=session_id,
+                        authentication_source=PrincipalAuthenticationSource.TEST_FIXTURE,
+                    )
+                    try:
+                        delegation_service.close_delegation(
+                            delegation_id=cls_del_id,
+                            principal=cls_principal,
+                        )
+                    except Exception as e:
+                        notes.append(f"Close error: {e}")
+            elif step.metadata.get("create_cross_session_grant_key"):
+                foreign_sess = uuid4()
+                foreign_intent = intent_service.create_intent(
+                    IntentContractCreate(
+                        session_id=str(foreign_sess),
+                        agent_id=str(agent_id),
+                        goal="Foreign session intent",
+                        allowed_tools=["web.search"],
+                    )
+                )
+                foreign_princ = AgentPrincipal(
+                    agent_id=str(agent_id),
+                    session_id=foreign_sess,
+                    authentication_source=PrincipalAuthenticationSource.TEST_FIXTURE,
+                    is_control_plane=True,
+                )
+                foreign_res = delegation_service.propose_delegation(
+                    DelegationProposal(
+                        session_id=foreign_sess,
+                        root_intent_id=foreign_intent.intent_id,
+                        delegator_agent_id=str(agent_id),
+                        delegatee_agent_id=current_agent_id,
+                        delegated_task_id="task-foreign",
+                        requested_tools=["web.search"],
+                    ),
+                    principal=foreign_princ,
+                )
+                delegation_map[step.metadata["create_cross_session_grant_key"]] = (
+                    foreign_res.delegation_id
+                )
 
-            except (
-                ParentActionNotFoundError,
-                CrossSessionParentError,
-                InvalidTrajectoryContinuationError,
-                ValueError,
-                Exception,
-            ) as e:
-                error_msg = type(e).__name__
-                notes.append(f"Step {step.step_id} caught exception: {error_msg} ({e})")
+            # Handle Delegation Creation Steps
+            if step.is_delegation_creation:
+                prop_data = step.delegation_proposal or {}
+                parent_del_id = None
+                if "parent_delegation_key" in prop_data:
+                    parent_del_id = delegation_map.get(prop_data["parent_delegation_key"])
+                elif "parent_delegation_id" in prop_data:
+                    parent_del_id = prop_data["parent_delegation_id"]
+
+                if "requested_resources" in prop_data:
+                    req_scope = prop_data["requested_resources"]
+                    if isinstance(req_scope, list):
+                        res_scope = ResourceAuthorityScopeRequest.allowlist(req_scope)
+                    elif isinstance(req_scope, ResourceAuthorityScopeRequest):
+                        res_scope = req_scope
+                    else:
+                        res_scope = ResourceAuthorityScopeRequest.unconstrained()
+                elif "requested_resource_scope" in prop_data:
+                    res_scope = prop_data["requested_resource_scope"]
+                else:
+                    # Inherit in-scope resource bounds from parent / root intent
+                    if parent_del_id:
+                        parent_grant = delegation_store.get_grant(parent_del_id)
+                        if parent_grant:
+                            res_scope = (
+                                ResourceAuthorityScopeRequest.allowlist(
+                                    list(
+                                        parent_grant.authority_envelope.resource_scope.allowed_resources
+                                    )
+                                )
+                                if parent_grant.authority_envelope.resource_scope.mode
+                                == AuthorityScopeMode.ALLOWLIST
+                                else ResourceAuthorityScopeRequest.unconstrained()
+                            )
+                        else:
+                            res_scope = ResourceAuthorityScopeRequest.allowlist(
+                                list(intent.allowed_resources)
+                            )
+                    else:
+                        res_scope = ResourceAuthorityScopeRequest.allowlist(
+                            list(intent.allowed_resources)
+                        )
+
+                raw_delegatee = prop_data.get("delegatee_agent_id")
+                if isinstance(raw_delegatee, str):
+                    delegatee_id = raw_delegatee
+                elif isinstance(raw_delegatee, UUID):
+                    delegatee_id = str(raw_delegatee)
+                else:
+                    delegatee_id = str(uuid4())
+
+                del_prop = DelegationProposal(
+                    session_id=session_id,
+                    delegator_agent_id=current_agent_id,
+                    delegatee_agent_id=delegatee_id,
+                    parent_delegation_id=parent_del_id,
+                    delegated_task_id=prop_data.get("delegated_task_id", f"task-{step.step_id}"),
+                    requested_tools=prop_data.get("requested_tools", ["web.search"]),
+                    requested_resource_scope=res_scope,
+                    requested_environments=prop_data.get(
+                        "requested_environments", [TargetEnvironment.PRODUCTION]
+                    ),
+                    requested_classifications=prop_data.get(
+                        "requested_classifications",
+                        prop_data.get(
+                            "requested_data_classifications",
+                            [DataClassification.PUBLIC, DataClassification.INTERNAL],
+                        ),
+                    ),
+                    requested_max_actions=prop_data.get("requested_max_actions", 10),
+                    requested_ttl_seconds=prop_data.get("requested_ttl_seconds", 3600),
+                    allow_subdelegation=prop_data.get("allow_subdelegation", True),
+                    requested_depth=prop_data.get(
+                        "requested_depth",
+                        prop_data.get("requested_subdelegation_depth", 3),
+                    ),
+                )
+
+                try:
+                    create_res = delegation_service.propose_delegation(
+                        proposal=del_prop, principal=principal
+                    )
+                    actual_decision = create_res.decision
+                    actual_rules = list(create_res.matched_rules)
+                    if create_res.delegation_id and step.delegation_key:
+                        delegation_map[step.delegation_key] = create_res.delegation_id
+                    elif (
+                        create_res.delegation_request_id
+                        and step.delegation_key
+                        and not create_res.delegation_id
+                    ):
+                        delegation_map[step.delegation_key] = create_res.delegation_request_id
+                    if (
+                        step.metadata.get("save_request_id_as_delegation_key")
+                        and create_res.delegation_request_id
+                    ):
+                        delegation_map[step.metadata["save_request_id_as_delegation_key"]] = (
+                            create_res.delegation_request_id
+                        )
+                    if create_res.delegation_request_id:
+                        action_id = create_res.delegation_request_id
+                        step_map[step.step_id] = action_id
+                        evidence_actions.append(action_id)
+
+                    if actual_decision == PolicyDecision.REQUIRE_APPROVAL and step.request_approval:
+                        approval_attempted = True
+                        if step.mutate_intent_before_approval:
+                            narrow_req = step.mutate_intent_before_approval
+                            if "status" in narrow_req and narrow_req["status"] == "REVOKED":
+                                intent_service.revoke_intent(intent.intent_id)
+                            elif "tools" in narrow_req:
+                                intent_service.narrow_intent(
+                                    intent.intent_id,
+                                    IntentContractNarrow(
+                                        allowed_tools=narrow_req["tools"],
+                                        allowed_resources=narrow_req.get("resources"),
+                                        allowed_environments=narrow_req.get("environments"),
+                                        allowed_data_classifications=narrow_req.get(
+                                            "classifications"
+                                        ),
+                                    ),
+                                )
+
+                        appr_principal = AgentPrincipal(
+                            agent_id=current_agent_id,
+                            session_id=session_id,
+                            authentication_source=PrincipalAuthenticationSource.TEST_FIXTURE,
+                            is_control_plane=True,
+                        )
+                        try:
+                            appr_res = delegation_service.resolve_pending_approval(
+                                delegation_request_id=create_res.delegation_request_id,
+                                principal=appr_principal,
+                                approver_id="security-officer",
+                                decision=PolicyDecision.ALLOW,
+                            )
+                            if appr_res.delegation_id:
+                                approval_succeeded = True
+                                if step.delegation_key:
+                                    delegation_map[step.delegation_key] = appr_res.delegation_id
+                            else:
+                                approval_succeeded = False
+                        except Exception as ae:
+                            approval_succeeded = False
+                            notes.append(f"Delegation approval rejected: {ae}")
+
+                except Exception as e:
+                    error_msg = type(e).__name__
+                    notes.append(f"Step {step.step_id} delegation creation caught: {e}")
+
+            else:
+                # Regular Action Step
+                # If step expects REQUIRE_APPROVAL, mutate intent between evaluation and approval resolution.
+                # If step expects DENY or other, mutate intent before evaluation to test live root narrowing/revocation.
+                if (
+                    step.mutate_intent_before_approval
+                    and step.expected_decision != PolicyDecision.REQUIRE_APPROVAL
+                ):
+                    narrow_req = step.mutate_intent_before_approval
+                    if "status" in narrow_req and narrow_req["status"] == "REVOKED":
+                        intent_service.revoke_intent(intent.intent_id)
+                    elif "tools" in narrow_req:
+                        intent_service.narrow_intent(
+                            intent.intent_id,
+                            IntentContractNarrow(
+                                allowed_tools=narrow_req["tools"],
+                                allowed_resources=narrow_req.get("resources"),
+                                allowed_environments=narrow_req.get("environments"),
+                                allowed_data_classifications=narrow_req.get("classifications"),
+                            ),
+                        )
+
+                # Resolve Parent Action ID
+                parent_id: UUID | None = None
+                if step.omit_parent:
+                    parent_id = None
+                elif step.explicit_parent_action_id is not None:
+                    parent_id = step.explicit_parent_action_id
+                elif step.parent_step_id is not None:
+                    parent_id = step_map.get(step.parent_step_id)
+                else:
+                    parent_id = last_action_id
+
+                # Resolve Input Artifacts & Payload Bindings
+                input_artifact_ids: list[UUID] = []
+                for k in step.input_artifact_keys:
+                    if k in artifact_map:
+                        input_artifact_ids.append(artifact_map[k])
+
+                tool_args = dict(step.tool_arguments)
+                for param, art_key in step.payload_bindings.items():
+                    if param == "destination_path":
+                        if "destination" not in tool_args:
+                            tool_args["destination"] = f"https://example.com{art_key}"
+                    elif param in ("body", "data", "payload", "content", "token"):
+                        art_id = artifact_map.get(art_key)
+                        if art_id:
+                            tool_args[f"{param}_artifact_id"] = str(art_id)
+                            tool_args["body_artifact_id"] = str(art_id)
+                        else:
+                            tool_args[f"{param}_artifact_id"] = str(art_key)
+                            tool_args["body_artifact_id"] = str(art_key)
+                    else:
+                        tool_args[param] = art_key
+
+                input_trust = step.metadata.get("trust_level", TrustLevel.MEDIUM)
+                if not isinstance(input_trust, TrustLevel):
+                    try:
+                        input_trust = TrustLevel(str(input_trust))
+                    except ValueError:
+                        input_trust = TrustLevel.MEDIUM
+
+                # Resolve claimed delegation_id if any
+                claimed_del_id: UUID | None = None
+                if step.delegation_key:
+                    claimed_del_id = delegation_map.get(step.delegation_key)
+                elif step.delegation_proposal and "delegation_id" in step.delegation_proposal:
+                    raw_id = step.delegation_proposal["delegation_id"]
+                    claimed_del_id = UUID(raw_id) if isinstance(raw_id, str) else raw_id
+
+                proposal = AgentActionProposal(
+                    session_id=str(session_id),
+                    agent_id=str(current_agent_id),
+                    tool_name=step.tool_name,
+                    action_type=step.action_type,
+                    target_resource=step.resource_id,
+                    target_environment=step.environment,
+                    parent_action_id=parent_id,
+                    input_artifact_ids=input_artifact_ids,
+                    tool_arguments=tool_args,
+                    input_trust_level=input_trust,
+                    client_action_id=str(step.client_action_id) if step.client_action_id else None,
+                    delegation_id=claimed_del_id,
+                )
+
+                # Process Proposal through Real Gateway
+                try:
+                    action, decision = gateway.evaluate_proposal(proposal, principal=principal)
+                    action_id = action.action_id
+                    step_map[step.step_id] = action_id
+                    last_action_id = action_id
+                    evidence_actions.append(action_id)
+
+                    actual_decision = decision.decision
+                    actual_rules = list(decision.matched_rules)
+
+                    # If tool was authorized, execute through gateway
+                    if actual_decision == PolicyDecision.ALLOW:
+                        tool_result = gateway.execute_authorized_action(action.action_id)
+                        if tool_result is not None:
+                            tool_dispatched = True
+
+                    # Check if simulated side effects were recorded
+                    if any(c["action_id"] == action_id for c in mock_recorder.side_effects):
+                        side_effect = True
+
+                    # Handle Step Approval Flow if requested
+                    approval_attempted = False
+                    approval_succeeded = None
+                    if actual_decision == PolicyDecision.REQUIRE_APPROVAL and step.request_approval:
+                        approval_attempted = True
+                        # Apply intent mutation before approval if specified (for TOCTOU testing)
+                        if step.mutate_intent_before_approval:
+                            narrow_req = step.mutate_intent_before_approval
+                            if "status" in narrow_req and narrow_req["status"] == "REVOKED":
+                                intent_service.revoke_intent(intent.intent_id)
+                            elif "tools" in narrow_req:
+                                intent_service.narrow_intent(
+                                    intent.intent_id,
+                                    IntentContractNarrow(
+                                        allowed_tools=narrow_req["tools"],
+                                        allowed_resources=narrow_req.get("resources"),
+                                        allowed_environments=narrow_req.get("environments"),
+                                        allowed_data_classifications=narrow_req.get(
+                                            "classifications"
+                                        ),
+                                    ),
+                                )
+
+                        # Execute approval through Gateway
+                        try:
+                            appr_action, appr_res = gateway.resolve_pending_approval(
+                                action_id=action_id,
+                                approved=True,
+                            )
+                            if appr_res is not None and appr_res.get("success"):
+                                tool_dispatched = True
+                                approval_succeeded = True
+                            else:
+                                approval_succeeded = False
+                            if any(c["action_id"] == action_id for c in mock_recorder.side_effects):
+                                side_effect = True
+                        except (ValueError, PermissionError) as ae:
+                            approval_succeeded = False
+                            notes.append(f"Approval for {step.step_id} rejected: {ae}")
+
+                except (
+                    ParentActionNotFoundError,
+                    CrossSessionParentError,
+                    InvalidTrajectoryContinuationError,
+                    ValueError,
+                    Exception,
+                ) as e:
+                    error_msg = type(e).__name__
+                    notes.append(f"Step {step.step_id} caught exception: {error_msg} ({e})")
 
             step_duration = (time.perf_counter() - step_start) * 1000
 

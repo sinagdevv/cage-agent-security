@@ -290,35 +290,126 @@ def test_authorization_weakening_classification(runner):
 
 
 def test_scenario_registry_consistency():
-    """Verify registry invariants: uniqueness, coverage, and count consistency."""
+    """Verify registry invariants: uniqueness, coverage, exact phase milestones, and reporting consistency."""
     from collections import Counter
 
+    from attack_lab.models import (
+        AttackCategory,
+        AttackScenarioResult,
+        ScenarioOutcome,
+        TrajectoryStatus,
+    )
+    from attack_lab.reporting import generate_attack_metrics
+    from attack_lab.scenarios import get_all_scenarios
+    from attack_lab.scenarios.action_chain import get_action_chain_scenarios
+    from attack_lab.scenarios.authority_expansion import get_authority_expansion_scenarios
+    from attack_lab.scenarios.benign import get_benign_scenarios
+    from attack_lab.scenarios.delegation import get_delegation_scenarios
+    from attack_lab.scenarios.destination_attacks import get_destination_attacks_scenarios
+    from attack_lab.scenarios.exfiltration import get_exfiltration_scenarios
+    from attack_lab.scenarios.graph_and_limits import get_graph_and_limits_scenarios
+    from attack_lab.scenarios.injection import get_injection_scenarios
+    from attack_lab.scenarios.malicious_mcp import get_malicious_mcp_scenarios
+    from attack_lab.scenarios.policy_parity import get_policy_parity_scenarios
+    from attack_lab.scenarios.replay_attacks import get_replay_attacks_scenarios
+    from attack_lab.scenarios.unknown_entities import get_unknown_entities_scenarios
+
     scenarios = get_all_scenarios()
-    total_count = len(scenarios)
-    assert total_count > 0
+    registered_count = len(scenarios)
+    assert registered_count == 86, (
+        f"Expected exactly 86 registered scenarios, got {registered_count}"
+    )
 
-    # Uniqueness check
+    # 1. Uniqueness check
     scenario_ids = [s.scenario_id for s in scenarios]
-    assert len(scenario_ids) == len(set(scenario_ids)), "Duplicate scenario IDs in registry!"
+    assert len(scenario_ids) == len(set(scenario_ids)) == 86, (
+        f"Duplicate scenario IDs in registry! {len(scenario_ids)} vs {len(set(scenario_ids))}"
+    )
 
-    # Category validity check
+    # 2. Category validity check
     for sc in scenarios:
         assert isinstance(sc.category, AttackCategory), (
             f"Scenario {sc.scenario_id} has invalid category {sc.category}"
         )
 
-    # Benign vs Adversarial count derivation
+    # 3. Benign vs Adversarial count derivation (12 benign + 74 adversarial = 86)
     benign_count = sum(
         1
         for s in scenarios
         if s.category == AttackCategory.BENIGN_CONTROL or s.scenario_id.startswith("BENIGN")
     )
-    adversarial_count = total_count - benign_count
-    assert total_count == benign_count + adversarial_count
+    adversarial_count = sum(
+        1
+        for s in scenarios
+        if s.category != AttackCategory.BENIGN_CONTROL and not s.scenario_id.startswith("BENIGN")
+    )
+    assert benign_count == 12
+    assert adversarial_count == 74
+    assert benign_count + adversarial_count == 86 == registered_count
 
-    # Category counts sum to total
+    # 4. Category counts sum to total
     category_counts = Counter(s.category.value for s in scenarios)
-    assert sum(category_counts.values()) == total_count
+    assert sum(category_counts.values()) == registered_count == 86
+
+    # 5. Phase 7 frozen scenario ID set is present (52 inherited scenarios across 11 base categories)
+    pre_phase8_scenarios = (
+        get_benign_scenarios()
+        + get_injection_scenarios()
+        + get_action_chain_scenarios()
+        + get_exfiltration_scenarios()
+        + get_malicious_mcp_scenarios()
+        + get_unknown_entities_scenarios()
+        + get_authority_expansion_scenarios()
+        + get_destination_attacks_scenarios()
+        + get_replay_attacks_scenarios()
+        + get_graph_and_limits_scenarios()
+        + get_policy_parity_scenarios()
+    )
+    assert len(pre_phase8_scenarios) == 52, (
+        f"Expected 52 inherited pre-Phase 8 scenarios, got {len(pre_phase8_scenarios)}"
+    )
+    pre_phase8_ids = {s.scenario_id for s in pre_phase8_scenarios}
+    assert len(pre_phase8_ids) == 52
+    for p7_id in pre_phase8_ids:
+        assert p7_id in scenario_ids, (
+            f"Inherited pre-Phase 8 scenario {p7_id} missing from registry"
+        )
+
+    # 6. All 34 Phase 8 delegation scenario IDs are present (20 initial + 14 hardening)
+    p8_scenarios = get_delegation_scenarios()
+    assert len(p8_scenarios) == 34, (
+        f"Expected 34 Phase 8 delegation scenarios, got {len(p8_scenarios)}"
+    )
+    p8_ids = {s.scenario_id for s in p8_scenarios}
+    assert len(p8_ids) == 34
+    for p8_id in p8_ids:
+        assert p8_id in scenario_ids, f"Phase 8 scenario {p8_id} missing from registry"
+
+    # 7. Disjoint partition: pre-Phase 8 (52) + Phase 8 (34) = 86
+    assert pre_phase8_ids.isdisjoint(p8_ids)
+    assert len(pre_phase8_ids | p8_ids) == 86
+
+    # 8. Report summary and CLI evaluated count consistency
+    dummy_results = [
+        AttackScenarioResult(
+            scenario_id=s.scenario_id,
+            scenario_name=s.name,
+            category=s.category,
+            agent_manipulation_succeeded=False,
+            attack_goal_reached=False,
+            cage_bypass_succeeded=False,
+            scenario_passed=True,
+            overall_outcome=ScenarioOutcome.BLOCKED_AS_EXPECTED,
+            step_results=[],
+            final_trajectory_status=TrajectoryStatus.ACTIVE,
+        )
+        for s in scenarios
+    ]
+    metrics = generate_attack_metrics(dummy_results)
+    assert metrics["total_scenarios"] == registered_count == 86
+    assert metrics["benign_scenarios"] == 12
+    assert metrics["adversarial_scenarios"] == 74
+    assert len(dummy_results) == registered_count == 86
 
 
 def test_causal_distance_boundary_pair(runner):

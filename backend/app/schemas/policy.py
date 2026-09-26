@@ -15,8 +15,8 @@ from app.schemas.enums import (
 )
 
 # Global schema identifier for policy input
-POLICY_INPUT_SCHEMA_VERSION = "cage-policy-input-v4"
-POLICY_VERSION = "phase6-v1"
+POLICY_INPUT_SCHEMA_VERSION = "cage-policy-input-v5"
+POLICY_VERSION = "phase8-v1"
 
 
 class PolicyActionContext(BaseModel):
@@ -233,6 +233,60 @@ class PolicyTrajectoryContext(BaseModel):
     trajectory_instance_fingerprint: str = ""
 
 
+class PolicyApprovalFactContext(BaseModel):
+    """Normalized approval facts for delegation resolution and authorization."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    approval_context_present: bool = False
+    approval_required: bool = False
+    approval_decision: str | None = None
+    approval_identity_match: bool = False
+    approval_payload_hash_match: bool = False
+    approval_revalidation_passed: bool = False
+
+
+class PolicyDelegationContext(BaseModel):
+    """Authoritative, server-derived multi-agent delegation facts for runtime policy evaluation (Phase 8)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    operation: str = "NONE"  # NONE, CREATE_GRANT, EXECUTE_ACTION, RESOLVE_APPROVAL, REVOKE_GRANT
+    is_delegated: bool = False
+    delegation_id: str | None = None
+    parent_delegation_id: str | None = None
+    delegation_depth: int = 0
+    remaining_subdelegation_depth: int = 0
+
+    # CREATE_GRANT facts
+    caller_is_authorized_issuer: bool = False
+    parent_grant_valid: bool = False
+    cross_session_match: bool = True
+    subdelegation_allowed: bool = False
+    depth_within_limits: bool = False
+    scope_within_parent: bool = False
+    scope_within_root: bool = False
+    is_high_risk_delegation: bool = False
+
+    # EXECUTE_ACTION facts
+    principal_matches_delegatee: bool = False
+    effective_status: str = "ACTIVE"
+    budget_available: bool = True
+    current_tool_within_effective_authority: bool = False
+    current_resource_within_effective_authority: bool = True
+    current_environment_within_effective_authority: bool = True
+    current_classification_within_effective_authority: bool = True
+
+    # REVOKE_GRANT facts
+    caller_is_authorized_to_revoke: bool = False
+
+    # Approval sub-context
+    approval: PolicyApprovalFactContext = Field(default_factory=PolicyApprovalFactContext)
+
+    # Analysis status domain (Phase 8 isolated failure domain)
+    analysis_status: str = "COMPLETED"
+
+
 class CagePolicyInput(BaseModel):
     """Canonical, server-derived policy input document sent to policy evaluators.
 
@@ -255,6 +309,7 @@ class CagePolicyInput(BaseModel):
     graph: PolicyGraphContext = Field(default_factory=PolicyGraphContext)
     provenance: PolicyProvenanceContext = Field(default_factory=PolicyProvenanceContext)
     trajectory: PolicyTrajectoryContext = Field(default_factory=PolicyTrajectoryContext)
+    delegation: PolicyDelegationContext = Field(default_factory=PolicyDelegationContext)
 
 
 class OpaFinding(BaseModel):

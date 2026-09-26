@@ -1,6 +1,7 @@
 package cage.authorization
 
 import data.cage.data_flow
+import data.cage.delegation
 import data.cage.graph
 import data.cage.intent
 import data.cage.provenance
@@ -37,6 +38,9 @@ matched_findings[f] {
     f := trajectory.findings[_]
 }
 
+matched_findings[f] {
+    f := delegation.findings[_]
+}
+
 # Export array of findings
 findings = [f | f := matched_findings[_]]
-

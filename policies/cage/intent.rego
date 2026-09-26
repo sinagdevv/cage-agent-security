@@ -3,6 +3,7 @@ package cage.intent
 # Explicit blacklist check
 findings[f] {
     input.intent != null
+    input.action.action_type != "DELEGATION"
     input.action.tool_name == input.intent.denied_tools[_]
     f := {
         "rule_id": "RULE_TOOL_EXPLICITLY_DENIED",
@@ -15,6 +16,7 @@ findings[f] {
 # Default deny: Tool whitelist check
 findings[f] {
     input.intent != null
+    input.action.action_type != "DELEGATION"
     not tool_in_allowed_tools
     f := {
         "rule_id": "RULE_TOOL_OUTSIDE_INTENT",
@@ -31,6 +33,7 @@ tool_in_allowed_tools {
 # Environment scope check
 findings[f] {
     input.intent != null
+    input.action.action_type != "DELEGATION"
     not env_in_allowed_envs
     f := {
         "rule_id": "RULE_ENVIRONMENT_OUTSIDE_INTENT",
@@ -47,6 +50,7 @@ env_in_allowed_envs {
 # Approval-required tool check
 findings[f] {
     input.intent != null
+    input.action.action_type != "DELEGATION"
     input.action.tool_name == input.intent.requires_approval[_]
     f := {
         "rule_id": "RULE_APPROVAL_TOOL",
@@ -104,6 +108,7 @@ findings[f] {
 
 findings[f] {
     input.intent != null
+    input.action.action_type != "DELEGATION"
     input.intent.tool_calls_count >= input.intent.maximum_tool_calls
     f := {
         "rule_id": "RULE_TOOL_BUDGET_EXCEEDED",
@@ -118,6 +123,7 @@ findings[f] {
     input.intent != null
     input.intent.status == "ACTIVE"
     input.context.intent_mismatch == false
+    input.action.action_type != "DELEGATION"
     input.intent.tool_calls_count < input.intent.maximum_tool_calls
     not has_intent_violation
     f := {

@@ -61,6 +61,7 @@ class AttackCategory(StrEnum):
     TRUST_SPOOFING = "TRUST_SPOOFING"  # Cat S
     BENIGN_CONTROL = "BENIGN_CONTROL"  # Cat T
     MALICIOUS_MCP = "MALICIOUS_MCP"  # MCP Simulation
+    DELEGATION_ATTACKS = "DELEGATION_ATTACKS"  # Phase 8 Multi-Agent Attacks
 
 
 class InitialArtifactFixture(BaseModel):
@@ -88,6 +89,12 @@ class ScenarioStep(BaseModel):
     resource_id: str = "default-resource"
     resource_type: str = "resource"
     environment: TargetEnvironment = TargetEnvironment.PRODUCTION
+
+    # Multi-agent attributes (Phase 8)
+    agent_id: str | None = None
+    delegation_key: str | None = None
+    is_delegation_creation: bool = False
+    delegation_proposal: dict[str, Any] | None = None
 
     # Lineage and binding specifications
     parent_step_id: str | None = None  # Resolved to actual UUID during execution

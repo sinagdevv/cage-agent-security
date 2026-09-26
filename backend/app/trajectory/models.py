@@ -53,7 +53,7 @@ class ResourceAuthorityScope(BaseModel):
             return True
         if target_resource is None:
             return True
-        return target_resource in self.allowed_resources
+        return target_resource in self.allowed_resources or "*" in self.allowed_resources
 
 
 class AuthorityEnvelope(BaseModel):

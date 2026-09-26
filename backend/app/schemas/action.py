@@ -84,6 +84,9 @@ class AgentActionProposal(BaseModel):
     client_correlation_id: str | None = Field(
         default=None, description="Optional client-provided correlation ID (no auth meaning)"
     )
+    delegation_id: UUID | None = Field(
+        default=None, description="Untrusted client reference to claimed delegation grant"
+    )
 
 
 class AgentAction(BaseModel):
@@ -102,6 +105,9 @@ class AgentAction(BaseModel):
     client_action_id: str | None = Field(default=None, description="Correlated client proposal ID")
     trajectory_id: UUID | None = Field(
         default=None, description="Server-authoritative execution trajectory identifier (Phase 6)"
+    )
+    delegation_id: UUID | None = Field(
+        default=None, description="Server-validated authoritative delegation grant ID (Phase 8)"
     )
 
     # Context & Proposal Information
@@ -161,12 +167,14 @@ class AgentAction(BaseModel):
         proposal: AgentActionProposal,
         action_id: UUID | None = None,
         trajectory_id: UUID | None = None,
+        delegation_id: UUID | None = None,
     ) -> "AgentAction":
         """Instantiate an authoritative AgentAction from a client proposal."""
         return cls(
             action_id=action_id or uuid4(),
             client_action_id=proposal.client_action_id or proposal.client_correlation_id,
             trajectory_id=trajectory_id,
+            delegation_id=delegation_id,
             agent_id=proposal.agent_id,
             agent_instance_id=proposal.agent_instance_id,
             session_id=proposal.session_id,

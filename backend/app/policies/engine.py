@@ -69,6 +69,7 @@ class PolicyEngine:
             graph_context=policy_input.graph,
             provenance_context=policy_input.provenance,
             trajectory_context=policy_input.trajectory,
+            delegation_context=policy_input.delegation,
         )
         decision.policy_backend = PolicyBackend.PYTHON
         decision.policy_version = self.policy_version
@@ -137,6 +138,7 @@ class PolicyEngine:
             graph_context=policy_input.graph,
             provenance_context=policy_input.provenance,
             trajectory_context=policy_input.trajectory,
+            delegation_context=policy_input.delegation,
         )
 
         # 2. Shadow OPA evaluation

@@ -12,6 +12,7 @@ from app.schemas.enums import (
     TargetEnvironment,
     TrajectoryStatus,
 )
+from app.schemas.intent import IntentContract
 from app.trajectory.models import (
     AuthorityEnvelope,
     ResourceAuthorityScope,
@@ -315,3 +316,107 @@ def test_concurrent_action_recording_thread_safety(store: TrajectoryStore) -> No
         snap = store.get_snapshot(t_id)
         assert len(snap.evaluated_action_ids) == 5
         assert snap.status == TrajectoryStatus.ACTIVE
+
+
+def _make_intent(session_id: str, tools: list[str]) -> IntentContract:
+    return IntentContract(
+        intent_id=uuid4(),
+        session_id=session_id,
+        agent_id="root-agent",
+        user_id="user-1",
+        goal="Task",
+        allowed_tools=tools,
+        allowed_environments=[TargetEnvironment.DEVELOPMENT],
+        allowed_data_classifications=[DataClassification.PUBLIC],
+    )
+
+
+def test_delegated_trajectory_isolated_by_intent(store: TrajectoryStore) -> None:
+    """Agent B under Intent I1 and Agent B under Intent I2 must have separate trajectories even in the same session."""
+    session_id = "sess-multi-intent"
+    intent_1 = _make_intent(session_id, ["web.search"])
+    intent_2 = _make_intent(session_id, ["file.read"])
+
+    t1, created_1 = store.get_or_create_trajectory(intent_1, agent_id="agent-b")
+    t2, created_2 = store.get_or_create_trajectory(intent_2, agent_id="agent-b")
+
+    assert created_1 is True
+    assert created_2 is True
+    assert t1.trajectory_id != t2.trajectory_id
+    assert t1.agent_id == "agent-b"
+    assert t2.agent_id == "agent-b"
+    assert t1.intent_id == intent_1.intent_id
+    assert t2.intent_id == intent_2.intent_id
+
+
+def test_same_agent_same_session_different_intents_do_not_share_tip(store: TrajectoryStore) -> None:
+    """Advancing trajectory under Intent I1 must not advance the tip for the same agent under Intent I2."""
+    session_id = "sess-tip-isolation"
+    intent_1 = _make_intent(session_id, ["web.search"])
+    intent_2 = _make_intent(session_id, ["file.read"])
+
+    t1, _ = store.get_or_create_trajectory(intent_1, agent_id="agent-b")
+    t2, _ = store.get_or_create_trajectory(intent_2, agent_id="agent-b")
+
+    action_1 = uuid4()
+    store.record_action_evaluation(t1.trajectory_id, action_1, PolicyDecision.ALLOW)
+
+    t1_snap = store.get_snapshot(t1.trajectory_id)
+    t2_snap = store.get_snapshot(t2.trajectory_id)
+
+    assert t1_snap.last_action_id == action_1
+    assert t2_snap.last_action_id is None
+
+    # First action under Intent 2 must have parent_action_id=None, not action_1
+    action_2 = uuid4()
+    valid_with_none, _ = store.validate_continuation(
+        t2.trajectory_id, action_2, parent_action_id=None
+    )
+    assert valid_with_none is True
+
+    valid_with_wrong_parent, _ = store.validate_continuation(
+        t2.trajectory_id, action_2, parent_action_id=action_1
+    )
+    assert valid_with_wrong_parent is False
+
+
+def test_pending_approval_does_not_cross_intent_boundary(store: TrajectoryStore) -> None:
+    """A pending approval on Agent B's trajectory under Intent I1 must not block Agent B under Intent I2."""
+    session_id = "sess-approval-boundary"
+    intent_1 = _make_intent(session_id, ["web.search"])
+    intent_2 = _make_intent(session_id, ["file.read"])
+
+    t1, _ = store.get_or_create_trajectory(intent_1, agent_id="agent-b")
+    t2, _ = store.get_or_create_trajectory(intent_2, agent_id="agent-b")
+
+    pending_act = uuid4()
+    store.set_pending_approval(t1.trajectory_id, pending_act)
+
+    t1_snap = store.get_snapshot(t1.trajectory_id)
+    t2_snap = store.get_snapshot(t2.trajectory_id)
+
+    assert t1_snap.pending_approval_action_id == pending_act
+    assert t2_snap.pending_approval_action_id is None
+
+    # Trajectory 2 can continue without being blocked by pending approval on Trajectory 1
+    act2 = uuid4()
+    valid, _ = store.validate_continuation(t2.trajectory_id, act2, parent_action_id=None)
+    assert valid is True
+
+
+def test_quarantine_does_not_cross_intent_boundary(store: TrajectoryStore) -> None:
+    """Quarantining Agent B's trajectory under Intent I1 must not quarantine Agent B's trajectory under Intent I2."""
+    session_id = "sess-quarantine-boundary"
+    intent_1 = _make_intent(session_id, ["web.search"])
+    intent_2 = _make_intent(session_id, ["file.read"])
+
+    t1, _ = store.get_or_create_trajectory(intent_1, agent_id="agent-b")
+    t2, _ = store.get_or_create_trajectory(intent_2, agent_id="agent-b")
+
+    store.update_status(t1.trajectory_id, TrajectoryStatus.QUARANTINED)
+
+    t1_snap = store.get_snapshot(t1.trajectory_id)
+    t2_snap = store.get_snapshot(t2.trajectory_id)
+
+    assert t1_snap.status == TrajectoryStatus.QUARANTINED
+    assert t2_snap.status == TrajectoryStatus.ACTIVE
